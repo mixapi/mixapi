@@ -15,7 +15,7 @@ This backlog closes the highest-priority gaps between the current implementation
 - [x] Replace buffered SSE with provider-native streaming and pre-first-event fallback.
 - [x] Persist budget reservations and circuit state for multi-process deployments.
 - [x] Add token quotas alongside the existing request quota.
-- [ ] Add time-window filters, pagination, and JSONL export to usage reporting.
+- [x] Add time-window filters, pagination, and JSONL export to usage reporting.
 - [ ] Add admin APIs for tenant keys, model allowlists, budgets, and routing policies.
 - [ ] Add metrics and traces for provider latency, errors, fallbacks, circuit state, and budget denials.
 - [ ] Generate and validate an explicit OpenAPI contract and SDK fixtures.

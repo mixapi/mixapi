@@ -51,7 +51,16 @@ from mixapi.quota import InMemoryQuotaService, QuotaService, TokenReservation
 from mixapi.route_decisions import InMemoryRouteDecisionStore, RouteDecisionRecord
 from mixapi.routing import plan_route
 from mixapi.streaming import encode_sse
-from mixapi.usage import InMemoryUsageLedger, UsageEvent, usage_csv, usage_response
+from mixapi.usage import (
+    InMemoryUsageLedger,
+    UsageEvent,
+    UsageQueryValidationError,
+    build_usage_query,
+    encode_usage_cursor,
+    usage_csv,
+    usage_jsonl,
+    usage_response,
+)
 from mixapi.validation import validate_embedding_request, validate_response_request
 
 
@@ -556,21 +565,64 @@ def create_app(
         return route_decision_store.get_public(request_id, tenant_id=principal.tenant_id)
 
     @app.get("/v1/usage")
-    def get_usage(principal: Principal = Depends(authenticate)) -> dict[str, Any]:
-        return usage_response(usage_ledger.events(tenant_id=principal.tenant_id))
+    def get_usage(
+        start_time: str | None = None,
+        end_time: str | None = None,
+        limit: str = "50",
+        cursor: str | None = None,
+        principal: Principal = Depends(authenticate),
+    ) -> dict[str, Any]:
+        try:
+            query = build_usage_query(
+                tenant_id=principal.tenant_id,
+                start_time=start_time,
+                end_time=end_time,
+                limit=limit,
+                cursor=cursor,
+            )
+        except UsageQueryValidationError as error:
+            raise validation_error(error.code, error.message) from error
+        page = usage_ledger.query(query)
+        next_cursor = None
+        if page.has_more and page.events:
+            next_cursor = encode_usage_cursor(query, page.events[-1].sequence_id or 0)
+        return usage_response(
+            page.events,
+            has_more=page.has_more,
+            next_cursor=next_cursor,
+        )
 
     @app.get("/v1/usage/export")
     def export_usage(
         format: str = "csv",
+        start_time: str | None = None,
+        end_time: str | None = None,
         principal: Principal = Depends(authenticate),
     ) -> Response:
-        if format != "csv":
+        if format not in {"csv", "jsonl"}:
             raise validation_error(
                 "unsupported_usage_export_format",
-                "Only CSV usage export is supported.",
+                "Only CSV and JSONL usage export are supported.",
+            )
+        try:
+            query = build_usage_query(
+                tenant_id=principal.tenant_id,
+                start_time=start_time,
+                end_time=end_time,
+                limit=None,
+                cursor=None,
+            )
+        except UsageQueryValidationError as error:
+            raise validation_error(error.code, error.message) from error
+        events = usage_ledger.query(query).events
+        if format == "jsonl":
+            return Response(
+                content=usage_jsonl(events),
+                media_type="application/x-ndjson",
+                headers={"Content-Disposition": 'attachment; filename="mixapi-usage.jsonl"'},
             )
         return Response(
-            content=usage_csv(usage_ledger.events(tenant_id=principal.tenant_id)),
+            content=usage_csv(events),
             media_type="text/csv",
             headers={"Content-Disposition": 'attachment; filename="mixapi-usage.csv"'},
         )

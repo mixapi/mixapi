@@ -1,20 +1,27 @@
 from __future__ import annotations
 
-import sqlite3
 import json
+import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from time import time
 from typing import Callable, Iterator
 
-from mixapi.usage import UsageEvent
 from mixapi.auth import Principal
 from mixapi.budget import BudgetReservation
 from mixapi.circuits import is_transient_failure
 from mixapi.errors import budget_exceeded, not_found, validation_error
 from mixapi.idempotency import IdempotencyReplay, request_hash
 from mixapi.route_decisions import RouteDecisionRecord
+from mixapi.usage import (
+    UsageEvent,
+    UsagePage,
+    UsageQuery,
+    format_usage_timestamp,
+    parse_usage_timestamp,
+)
 
 
 class SQLiteDatabase:
@@ -51,12 +58,42 @@ class SQLiteDatabase:
                     provider_model TEXT NOT NULL,
                     input_tokens INTEGER NOT NULL,
                     output_tokens INTEGER NOT NULL,
-                    cost_usd TEXT NOT NULL
+                    cost_usd TEXT NOT NULL,
+                    created_at TEXT NOT NULL
                 )
                 """
             )
+            usage_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(usage_events)")
+            }
+            if "created_at" not in usage_columns:
+                connection.execute("ALTER TABLE usage_events ADD COLUMN created_at TEXT")
+                connection.execute(
+                    "UPDATE usage_events SET created_at = ? WHERE created_at IS NULL",
+                    (format_usage_timestamp(datetime.now(timezone.utc)),),
+                )
+            noncanonical_rows = connection.execute(
+                """
+                SELECT id, created_at FROM usage_events
+                WHERE created_at IS NULL OR length(created_at) != 27
+                """
+            ).fetchall()
+            for row in noncanonical_rows:
+                created_at = parse_usage_timestamp(row["created_at"])
+                if created_at is None:
+                    created_at = datetime.now(timezone.utc)
+                connection.execute(
+                    "UPDATE usage_events SET created_at = ? WHERE id = ?",
+                    (format_usage_timestamp(created_at), row["id"]),
+                )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_usage_events_tenant ON usage_events(tenant_id, id)"
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_usage_events_tenant_created_at_id
+                ON usage_events(tenant_id, created_at, id)
+                """
             )
             connection.execute(
                 """
@@ -315,8 +352,8 @@ class SQLiteUsageLedger:
                 INSERT INTO usage_events (
                     request_id, tenant_id, project_id, api_key_id, endpoint,
                     logical_model, provider, provider_model, input_tokens,
-                    output_tokens, cost_usd
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    output_tokens, cost_usd, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event.request_id,
@@ -330,6 +367,7 @@ class SQLiteUsageLedger:
                     event.input_tokens,
                     event.output_tokens,
                     str(event.cost_usd),
+                    format_usage_timestamp(event.created_at),
                 ),
             )
 
@@ -344,22 +382,54 @@ class SQLiteUsageLedger:
         with self.database.connect() as connection:
             rows = connection.execute(query, parameters).fetchall()
 
-        return [
-            UsageEvent(
-                request_id=row["request_id"],
-                tenant_id=row["tenant_id"],
-                project_id=row["project_id"],
-                api_key_id=row["api_key_id"],
-                endpoint=row["endpoint"],
-                logical_model=row["logical_model"],
-                provider=row["provider"],
-                provider_model=row["provider_model"],
-                input_tokens=row["input_tokens"],
-                output_tokens=row["output_tokens"],
-                cost_usd=Decimal(row["cost_usd"]),
-            )
-            for row in rows
-        ]
+        return [_usage_event_from_row(row) for row in rows]
+
+    def query(self, query: UsageQuery) -> UsagePage:
+        clauses = ["tenant_id = ?", "id > ?"]
+        parameters: list[str | int] = [query.tenant_id, query.after_sequence_id]
+        if query.start_time is not None:
+            clauses.append("created_at >= ?")
+            parameters.append(format_usage_timestamp(query.start_time))
+        if query.end_time is not None:
+            clauses.append("created_at <= ?")
+            parameters.append(format_usage_timestamp(query.end_time))
+
+        statement = f"SELECT * FROM usage_events WHERE {' AND '.join(clauses)} ORDER BY id"
+        if query.limit is not None:
+            statement += " LIMIT ?"
+            parameters.append(query.limit + 1)
+
+        with self.database.connect() as connection:
+            rows = connection.execute(statement, parameters).fetchall()
+
+        has_more = query.limit is not None and len(rows) > query.limit
+        if has_more:
+            rows = rows[: query.limit]
+        return UsagePage(
+            events=[_usage_event_from_row(row) for row in rows],
+            has_more=has_more,
+        )
+
+
+def _usage_event_from_row(row: sqlite3.Row) -> UsageEvent:
+    created_at = parse_usage_timestamp(row["created_at"])
+    if created_at is None:
+        raise ValueError("Persisted usage events require created_at.")
+    return UsageEvent(
+        request_id=row["request_id"],
+        tenant_id=row["tenant_id"],
+        project_id=row["project_id"],
+        api_key_id=row["api_key_id"],
+        endpoint=row["endpoint"],
+        logical_model=row["logical_model"],
+        provider=row["provider"],
+        provider_model=row["provider_model"],
+        input_tokens=row["input_tokens"],
+        output_tokens=row["output_tokens"],
+        cost_usd=Decimal(row["cost_usd"]),
+        created_at=created_at,
+        sequence_id=row["id"],
+    )
 
 
 class SQLiteIdempotencyStore:

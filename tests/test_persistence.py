@@ -1,6 +1,9 @@
+import sqlite3
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from threading import Barrier
@@ -11,6 +14,7 @@ from mixapi import persistence
 from mixapi.app import create_app
 from mixapi.auth import Principal
 from mixapi.errors import MixAPIError
+from mixapi.usage import UsageEvent
 
 
 AUTH_HEADERS = {"Authorization": "Bearer dev-key"}
@@ -231,6 +235,108 @@ class PersistenceTest(unittest.TestCase):
             self.assertEqual(events[0].request_id, "req_persist_usage")
             self.assertEqual(events[0].tenant_id, "tenant_dev")
 
+    def test_usage_query_survives_application_recreation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "mixapi.db"
+            first_app = create_app(database_path=database_path)
+            first_app.state.usage_ledger.record(
+                _usage_event(
+                    "req_sqlite_1",
+                    datetime(2026, 6, 9, 10, 0, tzinfo=timezone.utc),
+                )
+            )
+            first_app.state.usage_ledger.record(
+                _usage_event(
+                    "req_sqlite_2",
+                    datetime(2026, 6, 9, 10, 1, tzinfo=timezone.utc),
+                )
+            )
+
+            second_client = TestClient(create_app(database_path=database_path))
+            first_page = second_client.get(
+                "/v1/usage",
+                headers=AUTH_HEADERS,
+                params={
+                    "start_time": "2026-06-09T10:00:00Z",
+                    "end_time": "2026-06-09T10:01:00Z",
+                    "limit": 1,
+                },
+            )
+            second_page = second_client.get(
+                "/v1/usage",
+                headers=AUTH_HEADERS,
+                params={
+                    "start_time": "2026-06-09T10:00:00Z",
+                    "end_time": "2026-06-09T10:01:00Z",
+                    "limit": 1,
+                    "cursor": first_page.json()["next_cursor"],
+                },
+            )
+
+            self.assertEqual(first_page.status_code, 200)
+            self.assertEqual(first_page.json()["data"][0]["request_id"], "req_sqlite_1")
+            self.assertEqual(
+                first_page.json()["data"][0]["created_at"],
+                "2026-06-09T10:00:00.000000Z",
+            )
+            self.assertTrue(first_page.json()["has_more"])
+            self.assertEqual(second_page.status_code, 200)
+            self.assertEqual(second_page.json()["data"][0]["request_id"], "req_sqlite_2")
+            self.assertFalse(second_page.json()["has_more"])
+
+    def test_usage_schema_migrates_existing_database(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "mixapi.db"
+            with closing(sqlite3.connect(database_path)) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE usage_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        request_id TEXT NOT NULL,
+                        tenant_id TEXT NOT NULL,
+                        project_id TEXT NOT NULL,
+                        api_key_id TEXT NOT NULL,
+                        endpoint TEXT NOT NULL,
+                        logical_model TEXT NOT NULL,
+                        provider TEXT NOT NULL,
+                        provider_model TEXT NOT NULL,
+                        input_tokens INTEGER NOT NULL,
+                        output_tokens INTEGER NOT NULL,
+                        cost_usd TEXT NOT NULL
+                    )
+                    """
+                )
+                connection.commit()
+
+            create_app(database_path=database_path)
+
+            with closing(sqlite3.connect(database_path)) as connection:
+                columns = {
+                    row[1] for row in connection.execute("PRAGMA table_info(usage_events)")
+                }
+            self.assertIn("created_at", columns)
+
+    def test_usage_query_excludes_fractional_time_after_exact_end_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "mixapi.db"
+            app = create_app(database_path=database_path)
+            app.state.usage_ledger.record(
+                _usage_event(
+                    "req_fractional",
+                    datetime(2026, 6, 9, 10, 0, 0, 500000, tzinfo=timezone.utc),
+                )
+            )
+            client = TestClient(app)
+
+            response = client.get(
+                "/v1/usage",
+                headers=AUTH_HEADERS,
+                params={"end_time": "2026-06-09T10:00:00Z"},
+            )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["data"], [])
+
     def test_idempotency_replays_after_application_recreation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database_path = Path(directory) / "mixapi.db"
@@ -292,6 +398,23 @@ class PersistenceTest(unittest.TestCase):
 
             self.assertIsNotNone(replay)
             self.assertEqual(replay.response, first_response)
+
+
+def _usage_event(request_id: str, created_at: datetime) -> UsageEvent:
+    return UsageEvent(
+        request_id=request_id,
+        tenant_id="tenant_dev",
+        project_id="project_dev",
+        api_key_id="key_dev",
+        endpoint="responses",
+        logical_model="mixapi/balanced-chat",
+        provider="openai",
+        provider_model="gpt-test",
+        input_tokens=1,
+        output_tokens=1,
+        cost_usd=Decimal("0.000001"),
+        created_at=created_at,
+    )
 
 
 if __name__ == "__main__":
