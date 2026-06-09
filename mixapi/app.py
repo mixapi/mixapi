@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import uuid
 import os
-from decimal import Decimal
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -25,10 +26,11 @@ from mixapi.adapters import (
     embedding_text,
     extract_text,
 )
-from mixapi.auth import Principal, authenticate
+from mixapi.auth import AdminPrincipal, Principal, authenticate, build_admin_authenticator
 from mixapi.budget import BudgetService, InMemoryBudgetService
 from mixapi.catalog import default_catalog
 from mixapi.circuits import CircuitBreaker, InMemoryCircuitBreaker
+from mixapi.control_plane import InMemoryControlPlaneStore
 from mixapi.errors import (
     MixAPIError,
     budget_exceeded,
@@ -42,6 +44,7 @@ from mixapi.idempotency import InMemoryIdempotencyStore
 from mixapi.persistence import (
     SQLiteBudgetService,
     SQLiteCircuitBreaker,
+    SQLiteControlPlaneStore,
     SQLiteDatabase,
     SQLiteIdempotencyStore,
     SQLiteRouteDecisionStore,
@@ -82,6 +85,7 @@ def create_app(
     circuit_failure_threshold: int | None = None,
     circuit_recovery_seconds: float | None = None,
     token_quota_limit: int | None = None,
+    admin_api_key: str | None = None,
 ) -> FastAPI:
     app = FastAPI(title="MixAPI", version="0.1.0")
     catalog = default_catalog()
@@ -148,6 +152,11 @@ def create_app(
     )
     configured_database_path = database_path or os.getenv("MIXAPI_DATABASE_PATH")
     database = SQLiteDatabase(configured_database_path) if configured_database_path else None
+    control_plane = (
+        SQLiteControlPlaneStore(database) if database else InMemoryControlPlaneStore()
+    )
+    configured_admin_api_key = admin_api_key or os.getenv("MIXAPI_ADMIN_KEY")
+    authenticate_admin = build_admin_authenticator(configured_admin_api_key)
     budget = (
         SQLiteBudgetService(database, limit_usd=budget_limit)
         if database
@@ -176,6 +185,7 @@ def create_app(
     app.state.quota = quota
     app.state.budget = budget
     app.state.circuits = circuits
+    app.state.control_plane = control_plane
 
     @app.middleware("http")
     async def attach_request_context(request: Request, call_next):
@@ -626,6 +636,106 @@ def create_app(
             media_type="text/csv",
             headers={"Content-Disposition": 'attachment; filename="mixapi-usage.csv"'},
         )
+
+    @app.post("/admin/v1/api-keys", status_code=201)
+    def create_api_key(
+        request_body: dict[str, Any] = Body(default_factory=dict),
+        admin: AdminPrincipal = Depends(authenticate_admin),
+    ) -> dict[str, Any]:
+        values = _parse_api_key_create(request_body, catalog)
+        created = control_plane.create_api_key(**values, actor_id=admin.actor_id)
+        return {**created.record.public_dict(), "secret": created.secret}
+
+    @app.get("/admin/v1/api-keys")
+    def list_api_keys(
+        tenant_id: str | None = None,
+        _admin: AdminPrincipal = Depends(authenticate_admin),
+    ) -> dict[str, Any]:
+        if tenant_id is not None:
+            _validate_identifier(tenant_id, "tenant_id")
+        return {
+            "object": "list",
+            "data": [
+                record.public_dict()
+                for record in control_plane.list_api_keys(tenant_id=tenant_id)
+            ],
+        }
+
+    @app.patch("/admin/v1/api-keys/{api_key_id}")
+    def update_api_key(
+        api_key_id: str,
+        request_body: dict[str, Any] = Body(default_factory=dict),
+        admin: AdminPrincipal = Depends(authenticate_admin),
+    ) -> dict[str, Any]:
+        changes = _parse_api_key_patch(request_body, catalog)
+        return control_plane.update_api_key(
+            api_key_id,
+            changes,
+            actor_id=admin.actor_id,
+        ).public_dict()
+
+    @app.delete("/admin/v1/api-keys/{api_key_id}")
+    def revoke_api_key(
+        api_key_id: str,
+        admin: AdminPrincipal = Depends(authenticate_admin),
+    ) -> dict[str, Any]:
+        return control_plane.revoke_api_key(
+            api_key_id,
+            actor_id=admin.actor_id,
+        ).public_dict()
+
+    @app.put("/admin/v1/tenants/{tenant_id}/model-allowlist")
+    def set_tenant_model_allowlist(
+        tenant_id: str,
+        request_body: dict[str, Any] = Body(default_factory=dict),
+        admin: AdminPrincipal = Depends(authenticate_admin),
+    ) -> dict[str, Any]:
+        _validate_identifier(tenant_id, "tenant_id")
+        if set(request_body) != {"models"}:
+            raise validation_error(
+                "invalid_model_allowlist",
+                "Model allowlist payload must contain only `models`.",
+            )
+        models = _parse_model_allowlist(request_body.get("models"), catalog)
+        return control_plane.set_tenant_model_allowlist(
+            tenant_id,
+            models,
+            actor_id=admin.actor_id,
+        ).public_dict()
+
+    @app.put("/admin/v1/tenants/{tenant_id}/routing-policy")
+    def set_tenant_routing_policy(
+        tenant_id: str,
+        request_body: dict[str, Any] = Body(default_factory=dict),
+        admin: AdminPrincipal = Depends(authenticate_admin),
+    ) -> dict[str, Any]:
+        _validate_identifier(tenant_id, "tenant_id")
+        if set(request_body) != {"objective"}:
+            raise validation_error(
+                "invalid_routing_objective",
+                "Routing policy payload must contain only `objective`.",
+            )
+        objective = _parse_routing_objective(request_body.get("objective"))
+        return control_plane.set_tenant_routing_policy(
+            tenant_id,
+            objective,
+            actor_id=admin.actor_id,
+        ).public_dict()
+
+    @app.get("/admin/v1/audit-events")
+    def list_audit_events(
+        tenant_id: str | None = None,
+        _admin: AdminPrincipal = Depends(authenticate_admin),
+    ) -> dict[str, Any]:
+        if tenant_id is not None:
+            _validate_identifier(tenant_id, "tenant_id")
+        return {
+            "object": "list",
+            "data": [
+                event.public_dict()
+                for event in control_plane.list_audit_events(tenant_id=tenant_id)
+            ],
+        }
 
     return app
 
@@ -1167,3 +1277,194 @@ def _estimate_cost(
 
 def _format_money(value: Decimal) -> str:
     return format(value, "f")
+
+
+_PUBLIC_SCOPES = {
+    "models:read",
+    "responses:create",
+    "embeddings:create",
+    "usage:read",
+    "route-decisions:read",
+}
+
+_ROUTING_OBJECTIVES = {
+    "balanced",
+    "lowest-cost",
+    "lowest-latency",
+    "highest-reliability",
+}
+
+
+def _parse_api_key_create(
+    request_body: dict[str, Any],
+    catalog: dict[str, Any],
+) -> dict[str, Any]:
+    allowed_fields = {
+        "tenant_id",
+        "project_id",
+        "name",
+        "scopes",
+        "model_allowlist",
+        "budget_limit_usd",
+        "expires_at",
+    }
+    if unknown := set(request_body).difference(allowed_fields):
+        raise validation_error(
+            "invalid_api_key_payload",
+            f"Unsupported API key fields: {', '.join(sorted(unknown))}.",
+        )
+    return {
+        "tenant_id": _validate_identifier(request_body.get("tenant_id"), "tenant_id"),
+        "project_id": _validate_identifier(request_body.get("project_id"), "project_id"),
+        "name": _parse_optional_name(request_body.get("name")),
+        "scopes": _parse_scopes(
+            request_body.get(
+                "scopes",
+                ["models:read", "responses:create", "embeddings:create"],
+            )
+        ),
+        "model_allowlist": _parse_model_allowlist(
+            request_body.get("model_allowlist", []),
+            catalog,
+        ),
+        "budget_limit_usd": _parse_budget_limit(request_body.get("budget_limit_usd")),
+        "expires_at": _parse_expiry(request_body.get("expires_at")),
+    }
+
+
+def _parse_api_key_patch(
+    request_body: dict[str, Any],
+    catalog: dict[str, Any],
+) -> dict[str, Any]:
+    allowed_fields = {
+        "name",
+        "scopes",
+        "model_allowlist",
+        "budget_limit_usd",
+        "expires_at",
+        "status",
+    }
+    if not request_body or set(request_body).difference(allowed_fields):
+        raise validation_error(
+            "invalid_api_key_payload",
+            "API key patch contains no supported fields.",
+        )
+    changes: dict[str, Any] = {}
+    if "name" in request_body:
+        changes["name"] = _parse_optional_name(request_body["name"])
+    if "scopes" in request_body:
+        changes["scopes"] = _parse_scopes(request_body["scopes"])
+    if "model_allowlist" in request_body:
+        changes["model_allowlist"] = _parse_model_allowlist(
+            request_body["model_allowlist"],
+            catalog,
+        )
+    if "budget_limit_usd" in request_body:
+        changes["budget_limit_usd"] = _parse_budget_limit(
+            request_body["budget_limit_usd"]
+        )
+    if "expires_at" in request_body:
+        changes["expires_at"] = _parse_expiry(request_body["expires_at"])
+    if "status" in request_body:
+        if request_body["status"] not in {"active", "revoked"}:
+            raise validation_error("invalid_api_key_status", "Unsupported API key status.")
+        changes["status"] = request_body["status"]
+    return changes
+
+
+def _validate_identifier(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise validation_error(
+            f"invalid_{field}",
+            f"`{field}` must be a non-empty string.",
+        )
+    return value.strip()
+
+
+def _parse_optional_name(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise validation_error("invalid_api_key_name", "API key name must be a string.")
+    return value.strip()
+
+
+def _parse_scopes(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise validation_error("invalid_scopes", "Scopes must be a list of strings.")
+    scopes = tuple(dict.fromkeys(value))
+    if unknown := set(scopes).difference(_PUBLIC_SCOPES):
+        raise validation_error(
+            "invalid_scopes",
+            f"Unsupported scopes: {', '.join(sorted(unknown))}.",
+        )
+    return scopes
+
+
+def _parse_model_allowlist(
+    value: object,
+    catalog: dict[str, Any],
+) -> tuple[str, ...]:
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise validation_error(
+            "invalid_model_allowlist",
+            "Model allowlist must be a list of model IDs.",
+        )
+    models = tuple(dict.fromkeys(value))
+    if unknown := set(models).difference(catalog):
+        raise validation_error(
+            "invalid_model_allowlist",
+            f"Unknown logical models: {', '.join(sorted(unknown))}.",
+        )
+    return models
+
+
+def _parse_budget_limit(value: object) -> Decimal | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise validation_error(
+            "invalid_budget_limit_usd",
+            "Budget limit must be a positive decimal amount.",
+        )
+    try:
+        amount = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        amount = Decimal("NaN")
+    if not amount.is_finite() or amount <= 0:
+        raise validation_error(
+            "invalid_budget_limit_usd",
+            "Budget limit must be a positive decimal amount.",
+        )
+    return amount
+
+
+def _parse_expiry(value: object) -> datetime | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise validation_error("invalid_expires_at", "Expiry must be an RFC3339 timestamp.")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise validation_error(
+            "invalid_expires_at",
+            "Expiry must be an RFC3339 timestamp.",
+        ) from error
+    if parsed.tzinfo is None:
+        raise validation_error("invalid_expires_at", "Expiry must include a timezone.")
+    normalized = parsed.astimezone(timezone.utc)
+    if normalized <= datetime.now(timezone.utc):
+        raise validation_error("invalid_expires_at", "Expiry must be in the future.")
+    return normalized
+
+
+def _parse_routing_objective(value: object) -> str | None:
+    if value is None:
+        return None
+    if value not in _ROUTING_OBJECTIVES:
+        raise validation_error(
+            "invalid_routing_objective",
+            "Unsupported routing objective.",
+        )
+    return str(value)

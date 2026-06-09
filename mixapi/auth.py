@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
+from hmac import compare_digest
 
 from fastapi import Header
 
@@ -14,6 +16,11 @@ class Principal:
     project_id: str
     api_key_id: str
     scopes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class AdminPrincipal:
+    actor_id: str
 
 
 def configured_api_keys() -> dict[str, Principal]:
@@ -50,6 +57,24 @@ def authenticate(authorization: str | None = Header(default=None)) -> Principal:
         raise authentication_failed("invalid_api_key", "Invalid bearer API key.")
 
     return principal
+
+
+def build_admin_authenticator(expected_key: str | None) -> Callable[..., AdminPrincipal]:
+    def authenticate_admin(authorization: str | None = Header(default=None)) -> AdminPrincipal:
+        if not authorization:
+            raise authentication_failed("missing_admin_key", "Missing admin bearer key.")
+
+        scheme, _, token = authorization.partition(" ")
+        if (
+            scheme.lower() != "bearer"
+            or not token
+            or expected_key is None
+            or not compare_digest(token, expected_key)
+        ):
+            raise authentication_failed("invalid_admin_key", "Invalid admin bearer key.")
+        return AdminPrincipal(actor_id="admin")
+
+    return authenticate_admin
 
 
 def _split_env_keys(value: str) -> list[str]:
