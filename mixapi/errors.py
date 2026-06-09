@@ -38,6 +38,15 @@ def authentication_failed(code: str, message: str) -> MixAPIError:
     )
 
 
+def permission_denied(code: str, message: str) -> MixAPIError:
+    return MixAPIError(
+        type="permission_denied",
+        code=code,
+        message=message,
+        status_code=403,
+    )
+
+
 def validation_error(code: str, message: str) -> MixAPIError:
     return MixAPIError(
         type="validation_error",

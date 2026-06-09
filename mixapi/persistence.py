@@ -13,7 +13,7 @@ from typing import Callable, Iterator
 from uuid import uuid4
 
 from mixapi.auth import Principal
-from mixapi.budget import BudgetReservation
+from mixapi.budget import BudgetReservation, effective_budget_limit
 from mixapi.circuits import is_transient_failure
 from mixapi.control_plane import (
     ApiKeyRecord,
@@ -555,9 +555,19 @@ class SQLiteBudgetService:
         self.database = database
         self.limit_usd = limit_usd
 
-    def reserve(self, principal: Principal, estimated_cost_usd: Decimal) -> BudgetReservation:
-        reservation = BudgetReservation(principal.api_key_id, estimated_cost_usd)
-        if self.limit_usd is None:
+    def reserve(
+        self,
+        principal: Principal,
+        estimated_cost_usd: Decimal,
+        limit_usd: Decimal | None = None,
+    ) -> BudgetReservation:
+        effective_limit = effective_budget_limit(self.limit_usd, limit_usd)
+        reservation = BudgetReservation(
+            principal.api_key_id,
+            estimated_cost_usd,
+            tracked=effective_limit is not None,
+        )
+        if effective_limit is None:
             return reservation
 
         denied = False
@@ -575,7 +585,7 @@ class SQLiteBudgetService:
                 (Decimal(item["amount_usd"]) for item in reservation_rows),
                 start=Decimal("0"),
             )
-            if actual_spend + reserved_spend + estimated_cost_usd > self.limit_usd:
+            if actual_spend + reserved_spend + estimated_cost_usd > effective_limit:
                 denied = True
             else:
                 connection.execute(
@@ -597,7 +607,7 @@ class SQLiteBudgetService:
         return reservation
 
     def reconcile(self, reservation: BudgetReservation, actual_cost_usd: Decimal) -> None:
-        if self.limit_usd is None:
+        if not reservation.tracked:
             return
 
         with self.database.connect(immediate=True) as connection:
@@ -630,7 +640,7 @@ class SQLiteBudgetService:
             )
 
     def release(self, reservation: BudgetReservation) -> None:
-        if self.limit_usd is None:
+        if not reservation.tracked:
             return
 
         with self.database.connect(immediate=True) as connection:

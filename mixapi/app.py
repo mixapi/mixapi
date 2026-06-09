@@ -26,7 +26,13 @@ from mixapi.adapters import (
     embedding_text,
     extract_text,
 )
-from mixapi.auth import AdminPrincipal, Principal, authenticate, build_admin_authenticator
+from mixapi.auth import (
+    AdminPrincipal,
+    Principal,
+    build_admin_authenticator,
+    build_service_authenticator,
+    require_scope,
+)
 from mixapi.budget import BudgetService, InMemoryBudgetService
 from mixapi.catalog import default_catalog
 from mixapi.circuits import CircuitBreaker, InMemoryCircuitBreaker
@@ -157,6 +163,7 @@ def create_app(
     )
     configured_admin_api_key = admin_api_key or os.getenv("MIXAPI_ADMIN_KEY")
     authenticate_admin = build_admin_authenticator(configured_admin_api_key)
+    authenticate_service = build_service_authenticator(control_plane)
     budget = (
         SQLiteBudgetService(database, limit_usd=budget_limit)
         if database
@@ -198,24 +205,39 @@ def create_app(
         return error_response(request, error)
 
     @app.get("/v1/models")
-    def list_models(_principal: Principal = Depends(authenticate)) -> dict[str, object]:
+    def list_models(
+        principal: Principal = Depends(authenticate_service),
+    ) -> dict[str, object]:
+        require_scope(principal, "models:read")
         return {
             "object": "list",
-            "data": [model.public_dict() for model in catalog.values()],
+            "data": [
+                model.public_dict()
+                for model in catalog.values()
+                if principal.model_allowlist is None
+                or model.id in principal.model_allowlist
+            ],
         }
 
     @app.post("/v1/responses")
     def create_response(
         request: Request,
         request_body: dict[str, Any] = Body(default_factory=dict),
-        principal: Principal = Depends(authenticate),
+        principal: Principal = Depends(authenticate_service),
     ) -> Any:
+        require_scope(principal, "responses:create")
         idempotency_key = request.headers.get("idempotency-key")
         validate_response_request(request_body, idempotency_key=idempotency_key)
         if replay := idempotency_store.replay(principal, "responses", idempotency_key, request_body):
             return replay.response
 
-        decision = plan_route(catalog, request_body, endpoint="responses")
+        decision = plan_route(
+            catalog,
+            request_body,
+            endpoint="responses",
+            model_allowlist=principal.model_allowlist,
+            default_objective=principal.routing_objective,
+        )
         circuit_candidates, circuit_rejections = _circuit_eligible_candidates(
             decision.candidates,
             circuits,
@@ -245,7 +267,11 @@ def create_app(
             endpoint="responses",
         )
         rejected_candidates = (*decision.rejected, *circuit_rejections, *budget_rejections)
-        reservation = budget.reserve(principal, estimated_cost)
+        reservation = budget.reserve(
+            principal,
+            estimated_cost,
+            limit_usd=principal.budget_limit_usd,
+        )
         try:
             token_reservation = _reserve_quotas(
                 quota,
@@ -416,14 +442,21 @@ def create_app(
     def create_embedding(
         request: Request,
         request_body: dict[str, Any] = Body(default_factory=dict),
-        principal: Principal = Depends(authenticate),
+        principal: Principal = Depends(authenticate_service),
     ) -> dict[str, Any]:
+        require_scope(principal, "embeddings:create")
         idempotency_key = request.headers.get("idempotency-key")
         validate_embedding_request(request_body)
         if replay := idempotency_store.replay(principal, "embeddings", idempotency_key, request_body):
             return replay.response
 
-        decision = plan_route(catalog, request_body, endpoint="embeddings")
+        decision = plan_route(
+            catalog,
+            request_body,
+            endpoint="embeddings",
+            model_allowlist=principal.model_allowlist,
+            default_objective=principal.routing_objective,
+        )
         circuit_candidates, circuit_rejections = _circuit_eligible_candidates(
             decision.candidates,
             circuits,
@@ -453,7 +486,11 @@ def create_app(
             endpoint="embeddings",
         )
         rejected_candidates = (*decision.rejected, *circuit_rejections, *budget_rejections)
-        reservation = budget.reserve(principal, estimated_cost)
+        reservation = budget.reserve(
+            principal,
+            estimated_cost,
+            limit_usd=principal.budget_limit_usd,
+        )
         try:
             token_reservation = _reserve_quotas(
                 quota,
@@ -570,8 +607,9 @@ def create_app(
     @app.get("/v1/route-decisions/{request_id}")
     def get_route_decision(
         request_id: str,
-        principal: Principal = Depends(authenticate),
+        principal: Principal = Depends(authenticate_service),
     ) -> dict[str, Any]:
+        require_scope(principal, "route-decisions:read")
         return route_decision_store.get_public(request_id, tenant_id=principal.tenant_id)
 
     @app.get("/v1/usage")
@@ -580,8 +618,9 @@ def create_app(
         end_time: str | None = None,
         limit: str = "50",
         cursor: str | None = None,
-        principal: Principal = Depends(authenticate),
+        principal: Principal = Depends(authenticate_service),
     ) -> dict[str, Any]:
+        require_scope(principal, "usage:read")
         try:
             query = build_usage_query(
                 tenant_id=principal.tenant_id,
@@ -607,8 +646,9 @@ def create_app(
         format: str = "csv",
         start_time: str | None = None,
         end_time: str | None = None,
-        principal: Principal = Depends(authenticate),
+        principal: Principal = Depends(authenticate_service),
     ) -> Response:
+        require_scope(principal, "usage:read")
         if format not in {"csv", "jsonl"}:
             raise validation_error(
                 "unsupported_usage_export_format",

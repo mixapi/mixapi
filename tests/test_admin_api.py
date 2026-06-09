@@ -1,6 +1,8 @@
 import json
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
@@ -178,22 +180,244 @@ class AdminApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 404)
         self.assertEqual(response.json()["error"]["code"], "api_key_not_found")
 
-    def _create_key(self):
-        return self.client.post(
+    def test_managed_api_key_authenticates_for_public_endpoints(self) -> None:
+        created = self._create_key().json()
+
+        response = self.client.get(
+            "/v1/models",
+            headers=self._service_headers(created["secret"]),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["object"], "list")
+
+    def test_revoked_managed_api_key_is_rejected_immediately(self) -> None:
+        created = self._create_key().json()
+        self.client.delete(
+            f"/admin/v1/api-keys/{created['id']}",
+            headers=ADMIN_HEADERS,
+        )
+
+        response = self.client.get(
+            "/v1/models",
+            headers=self._service_headers(created["secret"]),
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["error"]["code"], "invalid_api_key")
+
+    def test_expired_managed_api_key_is_rejected_immediately(self) -> None:
+        created = self._create_key().json()
+        self.app.state.control_plane.update_api_key(
+            created["id"],
+            {"expires_at": datetime.now(timezone.utc) - timedelta(seconds=1)},
+            actor_id="admin",
+        )
+
+        response = self.client.get(
+            "/v1/models",
+            headers=self._service_headers(created["secret"]),
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["error"]["code"], "invalid_api_key")
+
+    def test_managed_api_key_scope_is_enforced(self) -> None:
+        created = self._create_key(scopes=["models:read"]).json()
+
+        response = self.client.post(
+            "/v1/responses",
+            headers=self._service_headers(created["secret"]),
+            json={"model": "mixapi/balanced-chat", "input": "Hello"},
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["error"]["type"], "permission_denied")
+        self.assertEqual(response.json()["error"]["code"], "missing_scope")
+
+    def test_key_and_tenant_model_allowlists_intersect_for_listing_and_dispatch(self) -> None:
+        created = self._create_key(
+            scopes=["models:read", "responses:create", "embeddings:create"],
+            model_allowlist=["mixapi/balanced-chat", "mixapi/embedding-small"],
+        ).json()
+        self.client.put(
+            "/admin/v1/tenants/tenant_acme/model-allowlist",
+            headers=ADMIN_HEADERS,
+            json={"models": ["mixapi/balanced-chat"]},
+        )
+        service_headers = self._service_headers(created["secret"])
+
+        listed = self.client.get("/v1/models", headers=service_headers)
+        denied = self.client.post(
+            "/v1/embeddings",
+            headers=service_headers,
+            json={"model": "mixapi/embedding-small", "input": "Hello"},
+        )
+
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(
+            [model["id"] for model in listed.json()["data"]],
+            ["mixapi/balanced-chat"],
+        )
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(denied.json()["error"]["code"], "model_not_allowed")
+
+    def test_disjoint_key_and_tenant_allowlists_deny_all_models(self) -> None:
+        created = self._create_key(
+            model_allowlist=["mixapi/balanced-chat"],
+        ).json()
+        self.client.put(
+            "/admin/v1/tenants/tenant_acme/model-allowlist",
+            headers=ADMIN_HEADERS,
+            json={"models": ["mixapi/embedding-small"]},
+        )
+        service_headers = self._service_headers(created["secret"])
+
+        listed = self.client.get("/v1/models", headers=service_headers)
+        denied = self.client.post(
+            "/v1/responses",
+            headers=service_headers,
+            json={"model": "mixapi/balanced-chat", "input": "Hello"},
+        )
+
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(listed.json()["data"], [])
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(denied.json()["error"]["code"], "model_not_allowed")
+
+    def test_tenant_routing_default_applies_only_without_request_override(self) -> None:
+        created = self._create_key(scopes=["responses:create"]).json()
+        self.client.put(
+            "/admin/v1/tenants/tenant_acme/routing-policy",
+            headers=ADMIN_HEADERS,
+            json={"objective": "highest-reliability"},
+        )
+        service_headers = self._service_headers(created["secret"])
+        request_body = {
+            "model": "mixapi/balanced-chat",
+            "input": "Route this",
+            "max_output_tokens": 4,
+        }
+
+        defaulted = self.client.post(
+            "/v1/responses",
+            headers=service_headers,
+            json=request_body,
+        )
+        overridden = self.client.post(
+            "/v1/responses",
+            headers=service_headers,
+            json={**request_body, "routing": {"objective": "lowest-cost"}},
+        )
+
+        self.assertEqual(defaulted.status_code, 200)
+        self.assertEqual(defaulted.json()["provider"], "openai")
+        self.assertEqual(overridden.status_code, 200)
+        self.assertEqual(overridden.json()["provider"], "ollama")
+
+    def test_managed_api_key_budgets_are_isolated(self) -> None:
+        low_budget = self._create_key(
+            project_id="project_low",
+            scopes=["responses:create"],
+            budget_limit_usd="0.00001000",
+        ).json()
+        high_budget = self._create_key(
+            project_id="project_high",
+            scopes=["responses:create"],
+            budget_limit_usd="0.00010000",
+        ).json()
+        request_body = {
+            "model": "mixapi/balanced-chat",
+            "input": "Budget",
+            "max_output_tokens": 4,
+            "native": {"provider": "openai"},
+        }
+
+        first_low = self.client.post(
+            "/v1/responses",
+            headers=self._service_headers(low_budget["secret"]),
+            json=request_body,
+        )
+        second_low = self.client.post(
+            "/v1/responses",
+            headers=self._service_headers(low_budget["secret"]),
+            json=request_body,
+        )
+        first_high = self.client.post(
+            "/v1/responses",
+            headers=self._service_headers(high_budget["secret"]),
+            json=request_body,
+        )
+
+        self.assertEqual(first_low.status_code, 200)
+        self.assertEqual(second_low.status_code, 402)
+        self.assertEqual(second_low.json()["error"]["code"], "api_key_budget_exceeded")
+        self.assertEqual(first_high.status_code, 200)
+
+    def test_managed_configuration_and_budget_enforcement_survive_sqlite_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "mixapi.sqlite3"
+            first_app = create_app(
+                admin_api_key="admin-secret",
+                database_path=database_path,
+            )
+            first_client = TestClient(first_app)
+            created = self._create_key(
+                client=first_client,
+                scopes=["responses:create"],
+                budget_limit_usd="0.00001000",
+            ).json()
+            request_body = {
+                "model": "mixapi/balanced-chat",
+                "input": "Budget",
+                "max_output_tokens": 4,
+                "native": {"provider": "openai"},
+            }
+
+            first = first_client.post(
+                "/v1/responses",
+                headers=self._service_headers(created["secret"]),
+                json=request_body,
+            )
+            restarted_client = TestClient(
+                create_app(
+                    admin_api_key="admin-secret",
+                    database_path=database_path,
+                )
+            )
+            second = restarted_client.post(
+                "/v1/responses",
+                headers=self._service_headers(created["secret"]),
+                json=request_body,
+            )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 402)
+        self.assertEqual(second.json()["error"]["code"], "api_key_budget_exceeded")
+
+    def _create_key(self, client=None, **overrides):
+        target_client = client or self.client
+        payload = {
+            "tenant_id": "tenant_acme",
+            "project_id": "project_chat",
+            "name": "chat service",
+            "scopes": ["models:read", "responses:create"],
+            "model_allowlist": ["mixapi/balanced-chat"],
+            "budget_limit_usd": "1.25",
+            "expires_at": (
+                datetime.now(timezone.utc) + timedelta(days=1)
+            ).isoformat(),
+        }
+        payload.update(overrides)
+        return target_client.post(
             "/admin/v1/api-keys",
             headers=ADMIN_HEADERS,
-            json={
-                "tenant_id": "tenant_acme",
-                "project_id": "project_chat",
-                "name": "chat service",
-                "scopes": ["models:read", "responses:create"],
-                "model_allowlist": ["mixapi/balanced-chat"],
-                "budget_limit_usd": "1.25",
-                "expires_at": (
-                    datetime.now(timezone.utc) + timedelta(days=1)
-                ).isoformat(),
-            },
+            json=payload,
         )
+
+    @staticmethod
+    def _service_headers(secret: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {secret}"}
 
 
 if __name__ == "__main__":

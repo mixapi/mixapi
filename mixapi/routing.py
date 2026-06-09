@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
-from mixapi.errors import capability_unsupported, validation_error
+from mixapi.errors import capability_unsupported, permission_denied, validation_error
 from mixapi.models import LogicalModel, ProviderModel, SchemaSupport
 
 
@@ -20,10 +20,17 @@ def plan_route(
     catalog: dict[str, LogicalModel],
     request_body: dict[str, Any],
     endpoint: str,
+    model_allowlist: tuple[str, ...] | None = None,
+    default_objective: str | None = None,
 ) -> RouteDecision:
     logical_model_id = request_body.get("model")
     if not isinstance(logical_model_id, str) or not logical_model_id:
         raise validation_error("model_required", "Request field `model` is required.")
+    if model_allowlist is not None and logical_model_id not in model_allowlist:
+        raise permission_denied(
+            "model_not_allowed",
+            "API key policy does not allow the requested model.",
+        )
 
     logical_model = catalog.get(logical_model_id)
     if logical_model is None:
@@ -34,7 +41,7 @@ def plan_route(
     requires_strict_schema = _requires_strict_schema(request_body)
     requires_function_tools = _requires_function_tools(request_body)
     provider_pin = _provider_pin(request_body)
-    objective = _routing_objective(request_body)
+    objective = _routing_objective(request_body, default_objective)
 
     eligible: list[tuple[ProviderModel, Decimal]] = []
     rejected: list[dict[str, str]] = []
@@ -156,11 +163,14 @@ def _provider_pin(request_body: dict[str, Any]) -> str | None:
     return provider
 
 
-def _routing_objective(request_body: dict[str, Any]) -> str:
+def _routing_objective(
+    request_body: dict[str, Any],
+    default_objective: str | None = None,
+) -> str:
     routing = request_body.get("routing")
     if not isinstance(routing, dict):
-        return "balanced"
-    objective = routing.get("objective", "balanced")
+        return default_objective or "balanced"
+    objective = routing.get("objective", default_objective or "balanced")
     if objective not in {"balanced", "lowest-cost", "lowest-latency", "highest-reliability"}:
         raise validation_error("invalid_routing_objective", "Unsupported routing objective.")
     return objective
