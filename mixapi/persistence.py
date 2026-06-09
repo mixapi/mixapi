@@ -3,15 +3,26 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from time import time
+from typing import Any
 from typing import Callable, Iterator
+from uuid import uuid4
 
 from mixapi.auth import Principal
 from mixapi.budget import BudgetReservation
 from mixapi.circuits import is_transient_failure
+from mixapi.control_plane import (
+    ApiKeyRecord,
+    AuditEvent,
+    CreatedApiKey,
+    TenantPolicy,
+    generate_api_key,
+    hash_api_key,
+)
 from mixapi.errors import budget_exceeded, not_found, validation_error
 from mixapi.idempotency import IdempotencyReplay, request_hash
 from mixapi.route_decisions import RouteDecisionRecord
@@ -158,6 +169,385 @@ class SQLiteDatabase:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS api_keys (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    project_id TEXT NOT NULL,
+                    name TEXT,
+                    key_hash TEXT NOT NULL UNIQUE,
+                    key_prefix TEXT NOT NULL,
+                    scopes_json TEXT NOT NULL,
+                    model_allowlist_json TEXT NOT NULL,
+                    budget_limit_usd TEXT,
+                    expires_at TEXT,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_api_keys_tenant ON api_keys(tenant_id, created_at)"
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tenant_policies (
+                    tenant_id TEXT PRIMARY KEY,
+                    model_allowlist_json TEXT NOT NULL,
+                    routing_objective TEXT,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS audit_events (
+                    sequence_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id TEXT NOT NULL UNIQUE,
+                    actor_id TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    target_type TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    before_json TEXT,
+                    after_json TEXT,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_audit_events_tenant
+                ON audit_events(tenant_id, sequence_id)
+                """
+            )
+
+
+class SQLiteControlPlaneStore:
+    def __init__(self, database: SQLiteDatabase) -> None:
+        self.database = database
+
+    def create_api_key(
+        self,
+        *,
+        tenant_id: str,
+        project_id: str,
+        name: str | None,
+        scopes: tuple[str, ...],
+        model_allowlist: tuple[str, ...],
+        budget_limit_usd: Decimal | None,
+        expires_at: datetime | None,
+        actor_id: str,
+    ) -> CreatedApiKey:
+        secret = generate_api_key()
+        now = datetime.now(timezone.utc)
+        record = ApiKeyRecord(
+            id=f"key_{uuid4().hex}",
+            tenant_id=tenant_id,
+            project_id=project_id,
+            name=name,
+            key_hash=hash_api_key(secret),
+            key_prefix=secret[:12],
+            scopes=tuple(scopes),
+            model_allowlist=tuple(model_allowlist),
+            budget_limit_usd=budget_limit_usd,
+            expires_at=expires_at,
+            status="active",
+            created_at=now,
+            updated_at=now,
+        )
+        with self.database.connect(immediate=True) as connection:
+            self._write_api_key(connection, record, insert=True)
+            self._insert_audit(
+                connection,
+                actor_id=actor_id,
+                tenant_id=tenant_id,
+                action="api_key.created",
+                target_type="api_key",
+                target_id=record.id,
+                before=None,
+                after=record.public_dict(),
+                created_at=now,
+            )
+        return CreatedApiKey(record=record, secret=secret)
+
+    def resolve_api_key(self, secret: str) -> ApiKeyRecord | None:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM api_keys WHERE key_hash = ?",
+                (hash_api_key(secret),),
+            ).fetchone()
+        if row is None:
+            return None
+        record = _api_key_from_row(row)
+        if record.status != "active":
+            return None
+        if record.expires_at is not None and record.expires_at <= datetime.now(timezone.utc):
+            return None
+        return record
+
+    def get_api_key(self, api_key_id: str) -> ApiKeyRecord:
+        with self.database.connect() as connection:
+            record = self._get_api_key(connection, api_key_id)
+        if record is None:
+            raise not_found("api_key_not_found", "API key was not found.")
+        return record
+
+    def list_api_keys(self, tenant_id: str | None = None) -> list[ApiKeyRecord]:
+        statement = "SELECT * FROM api_keys"
+        parameters: tuple[str, ...] = ()
+        if tenant_id is not None:
+            statement += " WHERE tenant_id = ?"
+            parameters = (tenant_id,)
+        statement += " ORDER BY created_at, id"
+        with self.database.connect() as connection:
+            rows = connection.execute(statement, parameters).fetchall()
+        return [_api_key_from_row(row) for row in rows]
+
+    def update_api_key(
+        self,
+        api_key_id: str,
+        changes: dict[str, Any],
+        *,
+        actor_id: str,
+    ) -> ApiKeyRecord:
+        with self.database.connect(immediate=True) as connection:
+            record = self._get_api_key(connection, api_key_id)
+            if record is None:
+                raise not_found("api_key_not_found", "API key was not found.")
+            updated = replace(record, **changes, updated_at=datetime.now(timezone.utc))
+            self._write_api_key(connection, updated, insert=False)
+            self._insert_audit(
+                connection,
+                actor_id=actor_id,
+                tenant_id=updated.tenant_id,
+                action="api_key.updated",
+                target_type="api_key",
+                target_id=updated.id,
+                before=record.public_dict(),
+                after=updated.public_dict(),
+                created_at=updated.updated_at,
+            )
+            return updated
+
+    def revoke_api_key(self, api_key_id: str, *, actor_id: str) -> ApiKeyRecord:
+        with self.database.connect(immediate=True) as connection:
+            record = self._get_api_key(connection, api_key_id)
+            if record is None:
+                raise not_found("api_key_not_found", "API key was not found.")
+            now = datetime.now(timezone.utc)
+            revoked = replace(record, status="revoked", updated_at=now)
+            self._write_api_key(connection, revoked, insert=False)
+            self._insert_audit(
+                connection,
+                actor_id=actor_id,
+                tenant_id=revoked.tenant_id,
+                action="api_key.revoked",
+                target_type="api_key",
+                target_id=revoked.id,
+                before=record.public_dict(),
+                after=revoked.public_dict(),
+                created_at=now,
+            )
+            return revoked
+
+    def set_tenant_model_allowlist(
+        self,
+        tenant_id: str,
+        model_allowlist: tuple[str, ...],
+        *,
+        actor_id: str,
+    ) -> TenantPolicy:
+        return self._update_tenant_policy(
+            tenant_id,
+            model_allowlist=tuple(model_allowlist),
+            routing_objective=None,
+            update_objective=False,
+            actor_id=actor_id,
+            action="tenant.model_allowlist.updated",
+        )
+
+    def set_tenant_routing_policy(
+        self,
+        tenant_id: str,
+        objective: str | None,
+        *,
+        actor_id: str,
+    ) -> TenantPolicy:
+        return self._update_tenant_policy(
+            tenant_id,
+            model_allowlist=None,
+            routing_objective=objective,
+            update_objective=True,
+            actor_id=actor_id,
+            action="tenant.routing_policy.updated",
+        )
+
+    def get_tenant_policy(self, tenant_id: str) -> TenantPolicy:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM tenant_policies WHERE tenant_id = ?",
+                (tenant_id,),
+            ).fetchone()
+        return _tenant_policy_from_row(row) if row is not None else TenantPolicy(tenant_id)
+
+    def list_audit_events(self, tenant_id: str | None = None) -> list[AuditEvent]:
+        statement = "SELECT * FROM audit_events"
+        parameters: tuple[str, ...] = ()
+        if tenant_id is not None:
+            statement += " WHERE tenant_id = ?"
+            parameters = (tenant_id,)
+        statement += " ORDER BY sequence_id"
+        with self.database.connect() as connection:
+            rows = connection.execute(statement, parameters).fetchall()
+        return [_audit_event_from_row(row) for row in rows]
+
+    def _update_tenant_policy(
+        self,
+        tenant_id: str,
+        *,
+        model_allowlist: tuple[str, ...] | None,
+        routing_objective: str | None,
+        update_objective: bool,
+        actor_id: str,
+        action: str,
+    ) -> TenantPolicy:
+        with self.database.connect(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT * FROM tenant_policies WHERE tenant_id = ?",
+                (tenant_id,),
+            ).fetchone()
+            current = _tenant_policy_from_row(row) if row is not None else TenantPolicy(tenant_id)
+            now = datetime.now(timezone.utc)
+            updated = replace(
+                current,
+                model_allowlist=(
+                    model_allowlist if model_allowlist is not None else current.model_allowlist
+                ),
+                routing_objective=(
+                    routing_objective if update_objective else current.routing_objective
+                ),
+                updated_at=now,
+            )
+            connection.execute(
+                """
+                INSERT INTO tenant_policies (
+                    tenant_id, model_allowlist_json, routing_objective, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(tenant_id) DO UPDATE SET
+                    model_allowlist_json = excluded.model_allowlist_json,
+                    routing_objective = excluded.routing_objective,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    updated.tenant_id,
+                    json.dumps(updated.model_allowlist, separators=(",", ":")),
+                    updated.routing_objective,
+                    _format_control_datetime(updated.updated_at),
+                ),
+            )
+            self._insert_audit(
+                connection,
+                actor_id=actor_id,
+                tenant_id=tenant_id,
+                action=action,
+                target_type="tenant_policy",
+                target_id=tenant_id,
+                before=current.public_dict(),
+                after=updated.public_dict(),
+                created_at=now,
+            )
+            return updated
+
+    def _get_api_key(
+        self,
+        connection: sqlite3.Connection,
+        api_key_id: str,
+    ) -> ApiKeyRecord | None:
+        row = connection.execute(
+            "SELECT * FROM api_keys WHERE id = ?",
+            (api_key_id,),
+        ).fetchone()
+        return _api_key_from_row(row) if row is not None else None
+
+    def _write_api_key(
+        self,
+        connection: sqlite3.Connection,
+        record: ApiKeyRecord,
+        *,
+        insert: bool,
+    ) -> None:
+        values = (
+            record.tenant_id,
+            record.project_id,
+            record.name,
+            record.key_hash,
+            record.key_prefix,
+            json.dumps(record.scopes, separators=(",", ":")),
+            json.dumps(record.model_allowlist, separators=(",", ":")),
+            str(record.budget_limit_usd) if record.budget_limit_usd is not None else None,
+            _format_control_datetime(record.expires_at),
+            record.status,
+            _format_control_datetime(record.created_at),
+            _format_control_datetime(record.updated_at),
+        )
+        if insert:
+            connection.execute(
+                """
+                INSERT INTO api_keys (
+                    id, tenant_id, project_id, name, key_hash, key_prefix,
+                    scopes_json, model_allowlist_json, budget_limit_usd,
+                    expires_at, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (record.id, *values),
+            )
+            return
+        connection.execute(
+            """
+            UPDATE api_keys SET
+                tenant_id = ?, project_id = ?, name = ?, key_hash = ?, key_prefix = ?,
+                scopes_json = ?, model_allowlist_json = ?, budget_limit_usd = ?,
+                expires_at = ?, status = ?, created_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (*values, record.id),
+        )
+
+    def _insert_audit(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        actor_id: str,
+        tenant_id: str,
+        action: str,
+        target_type: str,
+        target_id: str,
+        before: dict[str, Any] | None,
+        after: dict[str, Any] | None,
+        created_at: datetime,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO audit_events (
+                id, actor_id, tenant_id, action, target_type, target_id,
+                before_json, after_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                f"audit_{uuid4().hex}",
+                actor_id,
+                tenant_id,
+                action,
+                target_type,
+                target_id,
+                json.dumps(before, sort_keys=True, separators=(",", ":")) if before else None,
+                json.dumps(after, sort_keys=True, separators=(",", ":")) if after else None,
+                _format_control_datetime(created_at),
+            ),
+        )
 
 
 class SQLiteBudgetService:
@@ -556,3 +946,67 @@ class SQLiteRouteDecisionStore:
             attempts=tuple(json.loads(row["attempts_json"])),
             rejected_candidates=tuple(json.loads(row["rejected_candidates_json"])),
         ).public_dict()
+
+
+def _api_key_from_row(row: sqlite3.Row) -> ApiKeyRecord:
+    return ApiKeyRecord(
+        id=row["id"],
+        tenant_id=row["tenant_id"],
+        project_id=row["project_id"],
+        name=row["name"],
+        key_hash=row["key_hash"],
+        key_prefix=row["key_prefix"],
+        scopes=tuple(json.loads(row["scopes_json"])),
+        model_allowlist=tuple(json.loads(row["model_allowlist_json"])),
+        budget_limit_usd=(
+            Decimal(row["budget_limit_usd"]) if row["budget_limit_usd"] is not None else None
+        ),
+        expires_at=_parse_control_datetime(row["expires_at"]),
+        status=row["status"],
+        created_at=_require_control_datetime(row["created_at"]),
+        updated_at=_require_control_datetime(row["updated_at"]),
+    )
+
+
+def _tenant_policy_from_row(row: sqlite3.Row) -> TenantPolicy:
+    return TenantPolicy(
+        tenant_id=row["tenant_id"],
+        model_allowlist=tuple(json.loads(row["model_allowlist_json"])),
+        routing_objective=row["routing_objective"],
+        updated_at=_require_control_datetime(row["updated_at"]),
+    )
+
+
+def _audit_event_from_row(row: sqlite3.Row) -> AuditEvent:
+    return AuditEvent(
+        id=row["id"],
+        actor_id=row["actor_id"],
+        tenant_id=row["tenant_id"],
+        action=row["action"],
+        target_type=row["target_type"],
+        target_id=row["target_id"],
+        before=json.loads(row["before_json"]) if row["before_json"] is not None else None,
+        after=json.loads(row["after_json"]) if row["after_json"] is not None else None,
+        created_at=_require_control_datetime(row["created_at"]),
+    )
+
+
+def _format_control_datetime(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    return value.astimezone(timezone.utc).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z"
+    )
+
+
+def _parse_control_datetime(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+
+
+def _require_control_datetime(value: str) -> datetime:
+    parsed = _parse_control_datetime(value)
+    if parsed is None:
+        raise ValueError("Persisted control-plane timestamps may not be null.")
+    return parsed

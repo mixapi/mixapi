@@ -21,6 +21,76 @@ AUTH_HEADERS = {"Authorization": "Bearer dev-key"}
 
 
 class PersistenceTest(unittest.TestCase):
+    def test_control_plane_configuration_survives_application_recreation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = persistence.SQLiteDatabase(Path(directory) / "mixapi.db")
+            first = persistence.SQLiteControlPlaneStore(database)
+            created = first.create_api_key(
+                tenant_id="tenant_acme",
+                project_id="project_chat",
+                name="chat service",
+                scopes=("models:read", "responses:create"),
+                model_allowlist=("mixapi/balanced-chat",),
+                budget_limit_usd=Decimal("1.25"),
+                expires_at=None,
+                actor_id="admin",
+            )
+            first.set_tenant_model_allowlist(
+                "tenant_acme",
+                ("mixapi/balanced-chat",),
+                actor_id="admin",
+            )
+            first.set_tenant_routing_policy(
+                "tenant_acme",
+                "lowest-cost",
+                actor_id="admin",
+            )
+
+            second = persistence.SQLiteControlPlaneStore(database)
+
+            resolved = second.resolve_api_key(created.secret)
+            self.assertIsNotNone(resolved)
+            self.assertEqual(resolved.id, created.record.id)
+            self.assertEqual(resolved.budget_limit_usd, Decimal("1.25"))
+            policy = second.get_tenant_policy("tenant_acme")
+            self.assertEqual(policy.model_allowlist, ("mixapi/balanced-chat",))
+            self.assertEqual(policy.routing_objective, "lowest-cost")
+            events = second.list_audit_events(tenant_id="tenant_acme")
+            self.assertEqual(len(events), 3)
+            self.assertNotIn("key_hash", str([event.public_dict() for event in events]))
+
+    def test_control_plane_mutations_and_audits_are_atomic_under_concurrency(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = persistence.SQLiteDatabase(Path(directory) / "mixapi.db")
+            first = persistence.SQLiteControlPlaneStore(database)
+            second = persistence.SQLiteControlPlaneStore(database)
+            created = first.create_api_key(
+                tenant_id="tenant_acme",
+                project_id="project_chat",
+                name="initial",
+                scopes=("models:read",),
+                model_allowlist=(),
+                budget_limit_usd=None,
+                expires_at=None,
+                actor_id="admin",
+            )
+            barrier = Barrier(2)
+
+            def rename(store, name: str) -> None:
+                barrier.wait()
+                store.update_api_key(created.record.id, {"name": name}, actor_id="admin")
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                list(executor.map(lambda item: rename(*item), ((first, "one"), (second, "two"))))
+
+            final = first.get_api_key(created.record.id)
+            events = first.list_audit_events(tenant_id="tenant_acme")
+            self.assertIn(final.name, {"one", "two"})
+            self.assertEqual(
+                [event.action for event in events],
+                ["api_key.created", "api_key.updated", "api_key.updated"],
+            )
+
     def test_circuit_failures_are_shared_between_app_instances(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database_path = Path(directory) / "mixapi.db"
