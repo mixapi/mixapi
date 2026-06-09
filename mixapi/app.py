@@ -1,0 +1,1117 @@
+from __future__ import annotations
+
+import uuid
+import os
+from decimal import Decimal
+from pathlib import Path
+from typing import Any
+
+from fastapi import Body, Depends, Request
+from fastapi import FastAPI
+from fastapi.responses import Response, StreamingResponse
+
+from mixapi.adapters import (
+    AdapterResponse,
+    AnthropicProviderAdapter,
+    CompositeProviderAdapter,
+    DeterministicProviderAdapter,
+    GeminiProviderAdapter,
+    OllamaProviderAdapter,
+    OpenAICompatibleProviderAdapter,
+    ProviderDispatchError,
+    ProviderStream,
+    ProviderStreamEvent,
+    count_tokens,
+    embedding_text,
+    extract_text,
+)
+from mixapi.auth import Principal, authenticate
+from mixapi.budget import BudgetService, InMemoryBudgetService
+from mixapi.catalog import default_catalog
+from mixapi.circuits import CircuitBreaker, InMemoryCircuitBreaker
+from mixapi.errors import (
+    MixAPIError,
+    budget_exceeded,
+    error_response,
+    provider_rate_limited,
+    provider_unavailable,
+    upstream_timeout,
+    validation_error,
+)
+from mixapi.idempotency import InMemoryIdempotencyStore
+from mixapi.persistence import (
+    SQLiteBudgetService,
+    SQLiteCircuitBreaker,
+    SQLiteDatabase,
+    SQLiteIdempotencyStore,
+    SQLiteRouteDecisionStore,
+    SQLiteUsageLedger,
+)
+from mixapi.quota import InMemoryQuotaService, QuotaService, TokenReservation
+from mixapi.route_decisions import InMemoryRouteDecisionStore, RouteDecisionRecord
+from mixapi.routing import plan_route
+from mixapi.streaming import encode_sse
+from mixapi.usage import InMemoryUsageLedger, UsageEvent, usage_csv, usage_response
+from mixapi.validation import validate_embedding_request, validate_response_request
+
+
+def create_app(
+    request_quota_limit: int | None = None,
+    failed_response_providers: set[str] | None = None,
+    database_path: str | Path | None = None,
+    openai_base_url: str | None = None,
+    openai_api_key: str | None = None,
+    anthropic_base_url: str | None = None,
+    anthropic_api_key: str | None = None,
+    anthropic_version: str | None = None,
+    gemini_base_url: str | None = None,
+    gemini_api_key: str | None = None,
+    ollama_base_url: str | None = None,
+    ollama_api_key: str | None = None,
+    provider_timeout_seconds: float = 30.0,
+    budget_limit_usd: Decimal | str | None = None,
+    circuit_failure_threshold: int | None = None,
+    circuit_recovery_seconds: float | None = None,
+    token_quota_limit: int | None = None,
+) -> FastAPI:
+    app = FastAPI(title="MixAPI", version="0.1.0")
+    catalog = default_catalog()
+    deterministic_adapter = DeterministicProviderAdapter(
+        failed_response_providers=failed_response_providers
+    )
+    configured_openai_base_url = openai_base_url or os.getenv("MIXAPI_OPENAI_BASE_URL")
+    configured_openai_api_key = openai_api_key or os.getenv("MIXAPI_OPENAI_API_KEY")
+    configured_anthropic_base_url = anthropic_base_url or os.getenv("MIXAPI_ANTHROPIC_BASE_URL")
+    configured_anthropic_api_key = anthropic_api_key or os.getenv("MIXAPI_ANTHROPIC_API_KEY")
+    configured_anthropic_version = (
+        anthropic_version or os.getenv("MIXAPI_ANTHROPIC_VERSION", "2023-06-01")
+    )
+    configured_gemini_base_url = gemini_base_url or os.getenv("MIXAPI_GEMINI_BASE_URL")
+    configured_gemini_api_key = gemini_api_key or os.getenv("MIXAPI_GEMINI_API_KEY")
+    configured_ollama_base_url = ollama_base_url or os.getenv("MIXAPI_OLLAMA_BASE_URL")
+    configured_ollama_api_key = ollama_api_key or os.getenv("MIXAPI_OLLAMA_API_KEY")
+    provider_adapters: dict[str, Any] = {}
+    if configured_openai_base_url:
+        provider_adapters["openai"] = OpenAICompatibleProviderAdapter(
+            base_url=configured_openai_base_url,
+            api_key=configured_openai_api_key,
+            timeout_seconds=provider_timeout_seconds,
+        )
+    if configured_anthropic_base_url:
+        provider_adapters["anthropic"] = AnthropicProviderAdapter(
+            base_url=configured_anthropic_base_url,
+            api_key=configured_anthropic_api_key,
+            api_version=configured_anthropic_version,
+            timeout_seconds=provider_timeout_seconds,
+        )
+    if configured_gemini_base_url:
+        provider_adapters["gemini"] = GeminiProviderAdapter(
+            base_url=configured_gemini_base_url,
+            api_key=configured_gemini_api_key,
+            timeout_seconds=provider_timeout_seconds,
+        )
+    if configured_ollama_base_url:
+        provider_adapters["ollama"] = OllamaProviderAdapter(
+            base_url=configured_ollama_base_url,
+            api_key=configured_ollama_api_key,
+            timeout_seconds=provider_timeout_seconds,
+        )
+    adapter = CompositeProviderAdapter(
+        default_adapter=deterministic_adapter,
+        provider_adapters=provider_adapters,
+    )
+    configured_token_quota_limit = token_quota_limit
+    if configured_token_quota_limit is None:
+        raw_token_quota_limit = os.getenv("MIXAPI_TOKEN_QUOTA_LIMIT")
+        if raw_token_quota_limit is not None:
+            configured_token_quota_limit = int(raw_token_quota_limit)
+    quota = InMemoryQuotaService(
+        request_limit=request_quota_limit,
+        token_limit=configured_token_quota_limit,
+    )
+    configured_budget_limit = budget_limit_usd or os.getenv("MIXAPI_BUDGET_LIMIT_USD")
+    budget_limit = Decimal(str(configured_budget_limit)) if configured_budget_limit else None
+    configured_circuit_failure_threshold = circuit_failure_threshold or int(
+        os.getenv("MIXAPI_CIRCUIT_FAILURE_THRESHOLD", "3")
+    )
+    configured_circuit_recovery_seconds = circuit_recovery_seconds or float(
+        os.getenv("MIXAPI_CIRCUIT_RECOVERY_SECONDS", "30")
+    )
+    configured_database_path = database_path or os.getenv("MIXAPI_DATABASE_PATH")
+    database = SQLiteDatabase(configured_database_path) if configured_database_path else None
+    budget = (
+        SQLiteBudgetService(database, limit_usd=budget_limit)
+        if database
+        else InMemoryBudgetService(limit_usd=budget_limit)
+    )
+    circuits = (
+        SQLiteCircuitBreaker(
+            database,
+            failure_threshold=configured_circuit_failure_threshold,
+            recovery_timeout_seconds=configured_circuit_recovery_seconds,
+        )
+        if database
+        else InMemoryCircuitBreaker(
+            failure_threshold=configured_circuit_failure_threshold,
+            recovery_timeout_seconds=configured_circuit_recovery_seconds,
+        )
+    )
+    usage_ledger = SQLiteUsageLedger(database) if database else InMemoryUsageLedger()
+    idempotency_store = SQLiteIdempotencyStore(database) if database else InMemoryIdempotencyStore()
+    route_decision_store = (
+        SQLiteRouteDecisionStore(database) if database else InMemoryRouteDecisionStore()
+    )
+    app.state.usage_ledger = usage_ledger
+    app.state.idempotency_store = idempotency_store
+    app.state.route_decision_store = route_decision_store
+    app.state.quota = quota
+    app.state.budget = budget
+    app.state.circuits = circuits
+
+    @app.middleware("http")
+    async def attach_request_context(request: Request, call_next):
+        request.state.request_id = request.headers.get("x-request-id", f"req_{uuid.uuid4().hex}")
+        request.state.trace_id = request.headers.get("traceparent", f"trace_{uuid.uuid4().hex}")
+        return await call_next(request)
+
+    @app.exception_handler(MixAPIError)
+    async def mixapi_error_handler(request: Request, error: MixAPIError):
+        return error_response(request, error)
+
+    @app.get("/v1/models")
+    def list_models(_principal: Principal = Depends(authenticate)) -> dict[str, object]:
+        return {
+            "object": "list",
+            "data": [model.public_dict() for model in catalog.values()],
+        }
+
+    @app.post("/v1/responses")
+    def create_response(
+        request: Request,
+        request_body: dict[str, Any] = Body(default_factory=dict),
+        principal: Principal = Depends(authenticate),
+    ) -> Any:
+        idempotency_key = request.headers.get("idempotency-key")
+        validate_response_request(request_body, idempotency_key=idempotency_key)
+        if replay := idempotency_store.replay(principal, "responses", idempotency_key, request_body):
+            return replay.response
+
+        decision = plan_route(catalog, request_body, endpoint="responses")
+        circuit_candidates, circuit_rejections = _circuit_eligible_candidates(
+            decision.candidates,
+            circuits,
+        )
+        if not circuit_candidates:
+            route_decision_store.record(
+                RouteDecisionRecord(
+                    request_id=request.state.request_id,
+                    tenant_id=principal.tenant_id,
+                    project_id=principal.project_id,
+                    endpoint="responses",
+                    logical_model=request_body["model"],
+                    status="failed",
+                    selected_provider=None,
+                    selected_provider_model=None,
+                    attempts=(),
+                    rejected_candidates=(*decision.rejected, *circuit_rejections),
+                )
+            )
+            raise provider_unavailable(
+                "all_provider_circuits_open",
+                "All eligible provider circuits are open.",
+            )
+        candidates, budget_rejections, estimated_cost = _budget_eligible_candidates(
+            circuit_candidates,
+            request_body,
+            endpoint="responses",
+        )
+        rejected_candidates = (*decision.rejected, *circuit_rejections, *budget_rejections)
+        reservation = budget.reserve(principal, estimated_cost)
+        try:
+            token_reservation = _reserve_quotas(
+                quota,
+                principal,
+                _estimate_request_tokens(request_body, candidates, endpoint="responses"),
+            )
+        except MixAPIError:
+            budget.release(reservation)
+            raise
+        if request_body.get("stream", False):
+            try:
+                provider_stream, selected_candidate, failed_attempts = (
+                    _dispatch_response_stream_with_fallback(
+                        adapter=adapter,
+                        request_body=request_body,
+                        candidates=candidates,
+                        circuits=circuits,
+                    )
+                )
+            except AllCandidatesFailed as error:
+                budget.release(reservation)
+                quota.release_tokens(token_reservation)
+                route_decision_store.record(
+                    RouteDecisionRecord(
+                        request_id=request.state.request_id,
+                        tenant_id=principal.tenant_id,
+                        project_id=principal.project_id,
+                        endpoint="responses",
+                        logical_model=request_body["model"],
+                        status="failed",
+                        selected_provider=None,
+                        selected_provider_model=None,
+                        attempts=tuple(error.failed_attempts),
+                        rejected_candidates=rejected_candidates,
+                    )
+                )
+                raise _public_error_for_failed_attempts(error.failed_attempts)
+
+            return StreamingResponse(
+                _native_response_event_stream(
+                    provider_stream=provider_stream,
+                    selected_candidate=selected_candidate,
+                    failed_attempts=failed_attempts,
+                    rejected_candidates=rejected_candidates,
+                    request_body=request_body,
+                    request_id=request.state.request_id,
+                    principal=principal,
+                    reservation=reservation,
+                    budget=budget,
+                    quota=quota,
+                    token_reservation=token_reservation,
+                    circuits=circuits,
+                    usage_ledger=usage_ledger,
+                    route_decision_store=route_decision_store,
+                ),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+        try:
+            adapter_response, selected_candidate, failed_attempts = _dispatch_response_with_fallback(
+                adapter=adapter,
+                request_body=request_body,
+                candidates=candidates,
+                circuits=circuits,
+            )
+        except AllCandidatesFailed as error:
+            budget.release(reservation)
+            quota.release_tokens(token_reservation)
+            route_decision_store.record(
+                RouteDecisionRecord(
+                    request_id=request.state.request_id,
+                    tenant_id=principal.tenant_id,
+                    project_id=principal.project_id,
+                    endpoint="responses",
+                    logical_model=request_body["model"],
+                    status="failed",
+                    selected_provider=None,
+                    selected_provider_model=None,
+                    attempts=tuple(error.failed_attempts),
+                    rejected_candidates=rejected_candidates,
+                )
+            )
+            raise _public_error_for_failed_attempts(error.failed_attempts)
+
+        response_id = f"resp_{uuid.uuid4().hex}"
+        cost = _estimate_cost(
+            input_tokens=adapter_response.input_tokens,
+            output_tokens=adapter_response.output_tokens,
+            input_price=selected_candidate.pricing.get("input_per_million", "0"),
+            output_price=selected_candidate.pricing.get("output_per_million", "0"),
+        )
+        budget.reconcile(reservation, cost)
+        quota.reconcile_tokens(
+            token_reservation,
+            adapter_response.input_tokens + adapter_response.output_tokens,
+        )
+        usage_ledger.record(
+            UsageEvent(
+                request_id=request.state.request_id,
+                tenant_id=principal.tenant_id,
+                project_id=principal.project_id,
+                api_key_id=principal.api_key_id,
+                endpoint="responses",
+                logical_model=request_body["model"],
+                provider=selected_candidate.provider,
+                provider_model=selected_candidate.provider_model_id,
+                input_tokens=adapter_response.input_tokens,
+                output_tokens=adapter_response.output_tokens,
+                cost_usd=cost,
+            )
+        )
+        attempts = _route_attempts(
+            failed_attempts=failed_attempts,
+            selected_provider=selected_candidate.provider,
+            selected_provider_model=selected_candidate.provider_model_id,
+        )
+        route_decision_store.record(
+            RouteDecisionRecord(
+                request_id=request.state.request_id,
+                tenant_id=principal.tenant_id,
+                project_id=principal.project_id,
+                endpoint="responses",
+                logical_model=request_body["model"],
+                status="succeeded",
+                selected_provider=selected_candidate.provider,
+                selected_provider_model=selected_candidate.provider_model_id,
+                attempts=tuple(attempts),
+                rejected_candidates=rejected_candidates,
+            )
+        )
+
+        response_payload = {
+            "id": response_id,
+            "object": "response",
+            "model": request_body["model"],
+            "provider": selected_candidate.provider,
+            "output": _response_output(adapter_response),
+            "output_text": adapter_response.output_text,
+            "usage": {
+                "input_tokens": adapter_response.input_tokens,
+                "output_tokens": adapter_response.output_tokens,
+                "cached_input_tokens": 0,
+                "billable_units": [
+                    {"type": "input_tokens", "quantity": adapter_response.input_tokens},
+                    {"type": "output_tokens", "quantity": adapter_response.output_tokens},
+                ],
+            },
+            "cost": {
+                "provider_cost_usd": _format_money(cost),
+                "platform_cost_usd": _format_money(cost),
+            },
+            "route": {
+                "attempts": len(failed_attempts) + 1,
+                "fallback_used": bool(failed_attempts),
+                "selected_provider_model": selected_candidate.provider_model_id,
+                "failed_attempts": failed_attempts,
+                "decision_trace_id": request.state.request_id,
+                "rejected_candidates": list(rejected_candidates),
+            },
+        }
+        idempotency_store.store(principal, "responses", idempotency_key, request_body, response_payload)
+        return response_payload
+
+    @app.post("/v1/embeddings")
+    def create_embedding(
+        request: Request,
+        request_body: dict[str, Any] = Body(default_factory=dict),
+        principal: Principal = Depends(authenticate),
+    ) -> dict[str, Any]:
+        idempotency_key = request.headers.get("idempotency-key")
+        validate_embedding_request(request_body)
+        if replay := idempotency_store.replay(principal, "embeddings", idempotency_key, request_body):
+            return replay.response
+
+        decision = plan_route(catalog, request_body, endpoint="embeddings")
+        circuit_candidates, circuit_rejections = _circuit_eligible_candidates(
+            decision.candidates,
+            circuits,
+        )
+        if not circuit_candidates:
+            route_decision_store.record(
+                RouteDecisionRecord(
+                    request_id=request.state.request_id,
+                    tenant_id=principal.tenant_id,
+                    project_id=principal.project_id,
+                    endpoint="embeddings",
+                    logical_model=request_body["model"],
+                    status="failed",
+                    selected_provider=None,
+                    selected_provider_model=None,
+                    attempts=(),
+                    rejected_candidates=(*decision.rejected, *circuit_rejections),
+                )
+            )
+            raise provider_unavailable(
+                "all_provider_circuits_open",
+                "All eligible provider circuits are open.",
+            )
+        candidates, budget_rejections, estimated_cost = _budget_eligible_candidates(
+            circuit_candidates,
+            request_body,
+            endpoint="embeddings",
+        )
+        rejected_candidates = (*decision.rejected, *circuit_rejections, *budget_rejections)
+        reservation = budget.reserve(principal, estimated_cost)
+        try:
+            token_reservation = _reserve_quotas(
+                quota,
+                principal,
+                _estimate_request_tokens(request_body, candidates, endpoint="embeddings"),
+            )
+        except MixAPIError:
+            budget.release(reservation)
+            raise
+        try:
+            adapter_response, selected_candidate, failed_attempts = _dispatch_embedding_with_fallback(
+                adapter=adapter,
+                request_body=request_body,
+                candidates=candidates,
+                circuits=circuits,
+            )
+        except AllCandidatesFailed as error:
+            budget.release(reservation)
+            quota.release_tokens(token_reservation)
+            route_decision_store.record(
+                RouteDecisionRecord(
+                    request_id=request.state.request_id,
+                    tenant_id=principal.tenant_id,
+                    project_id=principal.project_id,
+                    endpoint="embeddings",
+                    logical_model=request_body["model"],
+                    status="failed",
+                    selected_provider=None,
+                    selected_provider_model=None,
+                    attempts=tuple(error.failed_attempts),
+                    rejected_candidates=rejected_candidates,
+                )
+            )
+            raise _public_error_for_failed_attempts(error.failed_attempts)
+
+        embedding = adapter_response.embedding or []
+        cost = _estimate_cost(
+            input_tokens=adapter_response.input_tokens,
+            output_tokens=0,
+            input_price=selected_candidate.pricing.get("input_per_million", "0"),
+            output_price="0",
+        )
+        budget.reconcile(reservation, cost)
+        quota.reconcile_tokens(token_reservation, adapter_response.input_tokens)
+        usage_ledger.record(
+            UsageEvent(
+                request_id=request.state.request_id,
+                tenant_id=principal.tenant_id,
+                project_id=principal.project_id,
+                api_key_id=principal.api_key_id,
+                endpoint="embeddings",
+                logical_model=request_body["model"],
+                provider=selected_candidate.provider,
+                provider_model=selected_candidate.provider_model_id,
+                input_tokens=adapter_response.input_tokens,
+                output_tokens=0,
+                cost_usd=cost,
+            )
+        )
+        attempts = _route_attempts(
+            failed_attempts=failed_attempts,
+            selected_provider=selected_candidate.provider,
+            selected_provider_model=selected_candidate.provider_model_id,
+        )
+        route_decision_store.record(
+            RouteDecisionRecord(
+                request_id=request.state.request_id,
+                tenant_id=principal.tenant_id,
+                project_id=principal.project_id,
+                endpoint="embeddings",
+                logical_model=request_body["model"],
+                status="succeeded",
+                selected_provider=selected_candidate.provider,
+                selected_provider_model=selected_candidate.provider_model_id,
+                attempts=tuple(attempts),
+                rejected_candidates=rejected_candidates,
+            )
+        )
+
+        response_payload = {
+            "object": "list",
+            "model": request_body["model"],
+            "provider": selected_candidate.provider,
+            "data": [
+                {
+                    "object": "embedding",
+                    "index": 0,
+                    "embedding": embedding,
+                }
+            ],
+            "usage": {
+                "input_tokens": adapter_response.input_tokens,
+                "output_tokens": 0,
+                "billable_units": [
+                    {"type": "embedding_tokens", "quantity": adapter_response.input_tokens}
+                ],
+            },
+            "cost": {
+                "provider_cost_usd": _format_money(cost),
+                "platform_cost_usd": _format_money(cost),
+            },
+            "route": {
+                "attempts": len(failed_attempts) + 1,
+                "fallback_used": bool(failed_attempts),
+                "selected_provider_model": selected_candidate.provider_model_id,
+                "failed_attempts": failed_attempts,
+                "decision_trace_id": request.state.request_id,
+                "rejected_candidates": list(rejected_candidates),
+            },
+        }
+        idempotency_store.store(principal, "embeddings", idempotency_key, request_body, response_payload)
+        return response_payload
+
+    @app.get("/v1/route-decisions/{request_id}")
+    def get_route_decision(
+        request_id: str,
+        principal: Principal = Depends(authenticate),
+    ) -> dict[str, Any]:
+        return route_decision_store.get_public(request_id, tenant_id=principal.tenant_id)
+
+    @app.get("/v1/usage")
+    def get_usage(principal: Principal = Depends(authenticate)) -> dict[str, Any]:
+        return usage_response(usage_ledger.events(tenant_id=principal.tenant_id))
+
+    @app.get("/v1/usage/export")
+    def export_usage(
+        format: str = "csv",
+        principal: Principal = Depends(authenticate),
+    ) -> Response:
+        if format != "csv":
+            raise validation_error(
+                "unsupported_usage_export_format",
+                "Only CSV usage export is supported.",
+            )
+        return Response(
+            content=usage_csv(usage_ledger.events(tenant_id=principal.tenant_id)),
+            media_type="text/csv",
+            headers={"Content-Disposition": 'attachment; filename="mixapi-usage.csv"'},
+        )
+
+    return app
+
+
+app = create_app()
+
+
+class AllCandidatesFailed(Exception):
+    def __init__(self, failed_attempts: list[dict[str, str]]) -> None:
+        super().__init__("all candidates failed")
+        self.failed_attempts = failed_attempts
+
+
+def _public_error_for_failed_attempts(failed_attempts: list[dict[str, str]]) -> MixAPIError:
+    reasons = {attempt["reason"] for attempt in failed_attempts}
+    if reasons == {"upstream_http_429"}:
+        return provider_rate_limited(
+            "all_candidates_rate_limited",
+            "All eligible providers were rate limited.",
+        )
+    if reasons == {"upstream_timeout"}:
+        return upstream_timeout(
+            "all_candidates_timed_out",
+            "All eligible providers timed out.",
+        )
+    return provider_unavailable("all_candidates_failed", "All eligible providers failed.")
+
+
+def _budget_eligible_candidates(
+    candidates,
+    request_body: dict[str, Any],
+    endpoint: str,
+) -> tuple[tuple[Any, ...], tuple[dict[str, str], ...], Decimal]:
+    routing = request_body.get("routing")
+    request_limit = None
+    if isinstance(routing, dict) and routing.get("max_cost_usd") is not None:
+        request_limit = Decimal(str(routing["max_cost_usd"]))
+
+    eligible: list[Any] = []
+    rejected: list[dict[str, str]] = []
+    estimates: list[Decimal] = []
+    for candidate in candidates:
+        estimate = _estimate_candidate_request_cost(request_body, candidate, endpoint)
+        if request_limit is not None and estimate > request_limit:
+            rejected.append(
+                {
+                    "provider": candidate.provider,
+                    "model": candidate.provider_model_id,
+                    "reason": "request_budget_exceeded",
+                }
+            )
+            continue
+        eligible.append(candidate)
+        estimates.append(estimate)
+
+    if not eligible:
+        raise budget_exceeded(
+            "request_budget_exceeded",
+            "No eligible provider fits the request cost limit.",
+        )
+    return tuple(eligible), tuple(rejected), max(estimates, default=Decimal("0"))
+
+
+def _circuit_eligible_candidates(
+    candidates,
+    circuits: CircuitBreaker,
+) -> tuple[tuple[Any, ...], tuple[dict[str, str], ...]]:
+    eligible: list[Any] = []
+    rejected: list[dict[str, str]] = []
+    for candidate in candidates:
+        if circuits.is_open(candidate.provider, candidate.provider_model_id):
+            rejected.append(
+                {
+                    "provider": candidate.provider,
+                    "model": candidate.provider_model_id,
+                    "reason": "provider_circuit_open",
+                }
+            )
+            continue
+        eligible.append(candidate)
+    return tuple(eligible), tuple(rejected)
+
+
+def _estimate_candidate_request_cost(request_body: dict[str, Any], candidate, endpoint: str) -> Decimal:
+    if endpoint == "embeddings":
+        input_tokens = count_tokens(embedding_text(request_body.get("input", "")))
+        output_tokens = 0
+    else:
+        input_tokens = count_tokens(extract_text(request_body.get("input", "")))
+        output_tokens = request_body.get("max_output_tokens", candidate.max_output_tokens)
+    return _estimate_cost(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        input_price=candidate.pricing.get("input_per_million", "0"),
+        output_price=candidate.pricing.get("output_per_million", "0"),
+    )
+
+
+def _estimate_request_tokens(request_body: dict[str, Any], candidates, endpoint: str) -> int:
+    if endpoint == "embeddings":
+        return count_tokens(embedding_text(request_body.get("input", "")))
+
+    input_tokens = count_tokens(extract_text(request_body.get("input", "")))
+    output_tokens = max(
+        (
+            request_body.get("max_output_tokens", candidate.max_output_tokens)
+            for candidate in candidates
+        ),
+        default=0,
+    )
+    return input_tokens + output_tokens
+
+
+def _reserve_quotas(
+    quota: QuotaService,
+    principal: Principal,
+    estimated_tokens: int,
+) -> TokenReservation:
+    token_reservation = quota.reserve_tokens(principal, estimated_tokens)
+    try:
+        quota.reserve_request(principal)
+    except MixAPIError:
+        quota.release_tokens(token_reservation)
+        raise
+    return token_reservation
+
+
+def _dispatch_response_with_fallback(
+    adapter: Any,
+    request_body: dict[str, Any],
+    candidates,
+    circuits: CircuitBreaker,
+) -> tuple[AdapterResponse, Any, list[dict[str, str]]]:
+    failed_attempts: list[dict[str, str]] = []
+
+    for candidate in candidates:
+        try:
+            response = adapter.dispatch_response(request_body, candidate)
+            circuits.record_success(candidate.provider, candidate.provider_model_id)
+            return response, candidate, failed_attempts
+        except ProviderDispatchError as error:
+            circuits.record_failure(error.provider, error.provider_model_id, error.reason)
+            failed_attempts.append(
+                {
+                    "provider": error.provider,
+                    "provider_model": error.provider_model_id,
+                    "status": "failed",
+                    "reason": error.reason,
+                }
+            )
+
+    raise AllCandidatesFailed(failed_attempts)
+
+
+def _dispatch_response_stream_with_fallback(
+    adapter: Any,
+    request_body: dict[str, Any],
+    candidates,
+    circuits: CircuitBreaker,
+) -> tuple[ProviderStream, Any, list[dict[str, str]]]:
+    failed_attempts: list[dict[str, str]] = []
+
+    for candidate in candidates:
+        try:
+            stream = adapter.start_response_stream(request_body, candidate)
+            return stream, candidate, failed_attempts
+        except ProviderDispatchError as error:
+            circuits.record_failure(error.provider, error.provider_model_id, error.reason)
+            failed_attempts.append(
+                {
+                    "provider": error.provider,
+                    "provider_model": error.provider_model_id,
+                    "status": "failed",
+                    "reason": error.reason,
+                }
+            )
+
+    raise AllCandidatesFailed(failed_attempts)
+
+
+def _native_response_event_stream(
+    provider_stream: ProviderStream,
+    selected_candidate: Any,
+    failed_attempts: list[dict[str, str]],
+    rejected_candidates,
+    request_body: dict[str, Any],
+    request_id: str,
+    principal: Principal,
+    reservation: Any,
+    budget: BudgetService,
+    quota: QuotaService,
+    token_reservation: TokenReservation,
+    circuits: CircuitBreaker,
+    usage_ledger: Any,
+    route_decision_store: Any,
+):
+    response_id = f"resp_{uuid.uuid4().hex}"
+    output_chunks: list[str] = []
+    try:
+        yield encode_sse(
+            "response.created",
+            {
+                "id": response_id,
+                "model": request_body["model"],
+                "provider": selected_candidate.provider,
+            },
+        )
+        completion: ProviderStreamEvent | None = None
+        for event in provider_stream:
+            if event.delta is not None:
+                output_chunks.append(event.delta)
+                yield encode_sse("response.output_text.delta", {"delta": event.delta})
+            if event.completed:
+                completion = event
+                break
+        if completion is None:
+            raise ProviderDispatchError(
+                selected_candidate.provider,
+                selected_candidate.provider_model_id,
+                "invalid_upstream_response",
+            )
+    except GeneratorExit:
+        provider_stream.close()
+        _finalize_interrupted_stream(
+            selected_candidate=selected_candidate,
+            failed_attempts=failed_attempts,
+            rejected_candidates=rejected_candidates,
+            request_body=request_body,
+            request_id=request_id,
+            principal=principal,
+            reservation=reservation,
+            budget=budget,
+            quota=quota,
+            token_reservation=token_reservation,
+            circuits=circuits,
+            usage_ledger=usage_ledger,
+            route_decision_store=route_decision_store,
+            output_text="".join(output_chunks),
+            reason="client_disconnected",
+        )
+        raise
+    except ProviderDispatchError as error:
+        _finalize_interrupted_stream(
+            selected_candidate=selected_candidate,
+            failed_attempts=failed_attempts,
+            rejected_candidates=rejected_candidates,
+            request_body=request_body,
+            request_id=request_id,
+            principal=principal,
+            reservation=reservation,
+            budget=budget,
+            quota=quota,
+            token_reservation=token_reservation,
+            circuits=circuits,
+            usage_ledger=usage_ledger,
+            route_decision_store=route_decision_store,
+            output_text="".join(output_chunks),
+            reason=error.reason,
+        )
+        yield encode_sse(
+            "response.failed",
+            {
+                "error": {
+                    "type": "stream_interrupted",
+                    "code": "provider_stream_interrupted",
+                    "message": "The provider stream ended before completion.",
+                }
+            },
+        )
+        return
+
+    output_text = "".join(output_chunks)
+    input_tokens = completion.input_tokens
+    if input_tokens is None:
+        input_tokens = count_tokens(extract_text(request_body.get("input", "")))
+    output_tokens = completion.output_tokens
+    if output_tokens is None:
+        output_tokens = count_tokens(output_text)
+    cost = _estimate_cost(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        input_price=selected_candidate.pricing.get("input_per_million", "0"),
+        output_price=selected_candidate.pricing.get("output_per_million", "0"),
+    )
+    budget.reconcile(reservation, cost)
+    quota.reconcile_tokens(token_reservation, input_tokens + output_tokens)
+    circuits.record_success(selected_candidate.provider, selected_candidate.provider_model_id)
+    usage_ledger.record(
+        _response_usage_event(
+            request_id=request_id,
+            principal=principal,
+            request_body=request_body,
+            selected_candidate=selected_candidate,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost=cost,
+        )
+    )
+    attempts = _route_attempts(
+        failed_attempts=failed_attempts,
+        selected_provider=selected_candidate.provider,
+        selected_provider_model=selected_candidate.provider_model_id,
+    )
+    route_decision_store.record(
+        RouteDecisionRecord(
+            request_id=request_id,
+            tenant_id=principal.tenant_id,
+            project_id=principal.project_id,
+            endpoint="responses",
+            logical_model=request_body["model"],
+            status="succeeded",
+            selected_provider=selected_candidate.provider,
+            selected_provider_model=selected_candidate.provider_model_id,
+            attempts=tuple(attempts),
+            rejected_candidates=tuple(rejected_candidates),
+        )
+    )
+    response_payload = _response_payload(
+        response_id=response_id,
+        request_body=request_body,
+        selected_candidate=selected_candidate,
+        output_text=output_text,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cost=cost,
+        failed_attempts=failed_attempts,
+        rejected_candidates=rejected_candidates,
+        request_id=request_id,
+    )
+    yield encode_sse("response.completed", {"response": response_payload})
+
+
+def _finalize_interrupted_stream(
+    selected_candidate: Any,
+    failed_attempts: list[dict[str, str]],
+    rejected_candidates,
+    request_body: dict[str, Any],
+    request_id: str,
+    principal: Principal,
+    reservation: Any,
+    budget: BudgetService,
+    quota: QuotaService,
+    token_reservation: TokenReservation,
+    circuits: CircuitBreaker,
+    usage_ledger: Any,
+    route_decision_store: Any,
+    output_text: str,
+    reason: str,
+) -> None:
+    input_tokens = count_tokens(extract_text(request_body.get("input", "")))
+    output_tokens = count_tokens(output_text)
+    cost = _estimate_cost(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        input_price=selected_candidate.pricing.get("input_per_million", "0"),
+        output_price=selected_candidate.pricing.get("output_per_million", "0"),
+    )
+    budget.reconcile(reservation, cost)
+    quota.reconcile_tokens(token_reservation, input_tokens + output_tokens)
+    circuits.record_failure(
+        selected_candidate.provider,
+        selected_candidate.provider_model_id,
+        reason,
+    )
+    usage_ledger.record(
+        _response_usage_event(
+            request_id=request_id,
+            principal=principal,
+            request_body=request_body,
+            selected_candidate=selected_candidate,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost=cost,
+        )
+    )
+    attempts = [
+        *failed_attempts,
+        {
+            "provider": selected_candidate.provider,
+            "provider_model": selected_candidate.provider_model_id,
+            "status": "failed",
+            "reason": reason,
+        },
+    ]
+    route_decision_store.record(
+        RouteDecisionRecord(
+            request_id=request_id,
+            tenant_id=principal.tenant_id,
+            project_id=principal.project_id,
+            endpoint="responses",
+            logical_model=request_body["model"],
+            status="failed",
+            selected_provider=selected_candidate.provider,
+            selected_provider_model=selected_candidate.provider_model_id,
+            attempts=tuple(attempts),
+            rejected_candidates=tuple(rejected_candidates),
+        )
+    )
+
+
+def _response_usage_event(
+    request_id: str,
+    principal: Principal,
+    request_body: dict[str, Any],
+    selected_candidate: Any,
+    input_tokens: int,
+    output_tokens: int,
+    cost: Decimal,
+) -> UsageEvent:
+    return UsageEvent(
+        request_id=request_id,
+        tenant_id=principal.tenant_id,
+        project_id=principal.project_id,
+        api_key_id=principal.api_key_id,
+        endpoint="responses",
+        logical_model=request_body["model"],
+        provider=selected_candidate.provider,
+        provider_model=selected_candidate.provider_model_id,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cost_usd=cost,
+    )
+
+
+def _response_payload(
+    response_id: str,
+    request_body: dict[str, Any],
+    selected_candidate: Any,
+    output_text: str,
+    input_tokens: int,
+    output_tokens: int,
+    cost: Decimal,
+    failed_attempts: list[dict[str, str]],
+    rejected_candidates,
+    request_id: str,
+) -> dict[str, Any]:
+    adapter_response = AdapterResponse(
+        output_text=output_text,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
+    return {
+        "id": response_id,
+        "object": "response",
+        "model": request_body["model"],
+        "provider": selected_candidate.provider,
+        "output": _response_output(adapter_response),
+        "output_text": output_text,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cached_input_tokens": 0,
+            "billable_units": [
+                {"type": "input_tokens", "quantity": input_tokens},
+                {"type": "output_tokens", "quantity": output_tokens},
+            ],
+        },
+        "cost": {
+            "provider_cost_usd": _format_money(cost),
+            "platform_cost_usd": _format_money(cost),
+        },
+        "route": {
+            "attempts": len(failed_attempts) + 1,
+            "fallback_used": bool(failed_attempts),
+            "selected_provider_model": selected_candidate.provider_model_id,
+            "failed_attempts": failed_attempts,
+            "decision_trace_id": request_id,
+            "rejected_candidates": list(rejected_candidates),
+        },
+    }
+
+
+def _dispatch_embedding_with_fallback(
+    adapter: Any,
+    request_body: dict[str, Any],
+    candidates,
+    circuits: CircuitBreaker,
+) -> tuple[AdapterResponse, Any, list[dict[str, str]]]:
+    failed_attempts: list[dict[str, str]] = []
+
+    for candidate in candidates:
+        try:
+            response = adapter.dispatch_embedding(request_body, candidate)
+            circuits.record_success(candidate.provider, candidate.provider_model_id)
+            return response, candidate, failed_attempts
+        except ProviderDispatchError as error:
+            circuits.record_failure(error.provider, error.provider_model_id, error.reason)
+            failed_attempts.append(
+                {
+                    "provider": error.provider,
+                    "provider_model": error.provider_model_id,
+                    "status": "failed",
+                    "reason": error.reason,
+                }
+            )
+
+    raise AllCandidatesFailed(failed_attempts)
+
+
+def _route_attempts(
+    failed_attempts: list[dict[str, str]],
+    selected_provider: str,
+    selected_provider_model: str,
+) -> list[dict[str, str]]:
+    return [
+        *failed_attempts,
+        {
+            "provider": selected_provider,
+            "provider_model": selected_provider_model,
+            "status": "succeeded",
+        },
+    ]
+
+
+def _response_output(adapter_response: AdapterResponse) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    if adapter_response.output_text:
+        output.append(
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": adapter_response.output_text}],
+            }
+        )
+    output.extend(adapter_response.tool_calls)
+    return output
+
+
+def _estimate_cost(
+    input_tokens: int,
+    output_tokens: int,
+    input_price: object,
+    output_price: object,
+) -> Decimal:
+    input_cost = (Decimal(str(input_price)) * Decimal(input_tokens)) / Decimal(1_000_000)
+    output_cost = (Decimal(str(output_price)) * Decimal(output_tokens)) / Decimal(1_000_000)
+    return (input_cost + output_cost).quantize(Decimal("0.00000001"))
+
+
+def _format_money(value: Decimal) -> str:
+    return format(value, "f")
