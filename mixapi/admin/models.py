@@ -86,7 +86,7 @@ def create_model_router(
     repository: PostgresConfigurationRepository,
     authenticate_admin: Callable[..., AdminPrincipal],
 ) -> APIRouter:
-    router = APIRouter(include_in_schema=False)
+    router = APIRouter()
 
     @router.post("/admin/v1/models", status_code=202)
     def create_model(body: dict[str, Any] = Body(default_factory=dict), admin=Depends(authenticate_admin)):
@@ -111,11 +111,11 @@ def create_model_router(
     def list_models(_admin=Depends(authenticate_admin)):
         return {"object": "list", "data": [item.public_dict() for item in repository.list_logical_models()]}
 
-    @router.get("/admin/v1/models/{model_id}")
+    @router.get("/admin/v1/models/{model_id:path}")
     def get_model(model_id: str, _admin=Depends(authenticate_admin)):
         return _model(repository, model_id).public_dict()
 
-    @router.patch("/admin/v1/models/{model_id}", status_code=202)
+    @router.patch("/admin/v1/models/{model_id:path}", status_code=202)
     def update_model(model_id: str, body: dict[str, Any] = Body(default_factory=dict), admin=Depends(authenticate_admin)):
         request = _parse(ModelPatch, body)
         changes = request.model_dump(exclude={"expected_updated_at"}, exclude_none=True)
@@ -136,7 +136,7 @@ def create_model_router(
             raise conflict("configuration_conflict", "Logical model was modified or its aliases conflict.") from error
         return _response("logical_model", mutation)
 
-    @router.delete("/admin/v1/models/{model_id}", status_code=202)
+    @router.delete("/admin/v1/models/{model_id:path}", status_code=202)
     def delete_model(model_id: str, admin=Depends(authenticate_admin)):
         try:
             mutation = repository.soft_delete_logical_model(model_id, actor_id=admin.actor_id)

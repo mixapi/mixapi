@@ -291,6 +291,9 @@ class UsageEndpointTest(unittest.TestCase):
         self.assertEqual(rows[0]["tenant_id"], "tenant_dev")
         self.assertEqual(rows[0]["endpoint"], "responses")
         self.assertEqual(rows[0]["logical_model"], "mixapi/balanced-chat")
+        self.assertNotEqual(rows[0]["configuration_version"], "0")
+        self.assertEqual(rows[0]["provider_connection_id"], "provider_openai")
+        self.assertEqual(rows[0]["provider_protocol"], "openai-compatible")
 
     def test_usage_csv_export_honors_time_window(self) -> None:
         app = create_app()

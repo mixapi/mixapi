@@ -50,6 +50,27 @@ class OpenAPIContractTest(unittest.TestCase):
                 "put",
             ): "setTenantRoutingPolicy",
             ("/admin/v1/audit-events", "get"): "listAuditEvents",
+            ("/admin/v1/providers", "post"): "createProviderConnection",
+            ("/admin/v1/providers", "get"): "listProviderConnections",
+            ("/admin/v1/providers/{provider_id}", "get"): "getProviderConnection",
+            ("/admin/v1/providers/{provider_id}", "patch"): "updateProviderConnection",
+            ("/admin/v1/providers/{provider_id}", "delete"): "deleteProviderConnection",
+            ("/admin/v1/providers/{provider_id}/test", "post"): "testProviderConnection",
+            ("/admin/v1/models", "post"): "createLogicalModel",
+            ("/admin/v1/models", "get"): "listLogicalModels",
+            ("/admin/v1/models/{model_id}", "get"): "getLogicalModel",
+            ("/admin/v1/models/{model_id}", "patch"): "updateLogicalModel",
+            ("/admin/v1/models/{model_id}", "delete"): "deleteLogicalModel",
+            ("/admin/v1/candidates", "post"): "createModelCandidate",
+            ("/admin/v1/candidates", "get"): "listModelCandidates",
+            ("/admin/v1/candidates/{candidate_id}", "get"): "getModelCandidate",
+            ("/admin/v1/candidates/{candidate_id}", "patch"): "updateModelCandidate",
+            ("/admin/v1/candidates/{candidate_id}", "delete"): "deleteModelCandidate",
+            (
+                "/admin/v1/configuration/versions/{version}",
+                "get",
+            ): "getConfigurationVersion",
+            ("/admin/v1/configuration/rebuild", "post"): "rebuildConfiguration",
         }
 
         for (path, method), operation_id in expected_operations.items():
@@ -109,10 +130,70 @@ class OpenAPIContractTest(unittest.TestCase):
             "TenantRoutingPolicyRequest",
             "TenantPolicy",
             "AuditEventList",
+            "ProviderCreateRequest",
+            "ProviderUpdateRequest",
+            "ProviderRecord",
+            "ProviderList",
+            "ProviderMutation",
+            "ProviderTestResult",
+            "LogicalModelCreateRequest",
+            "LogicalModelUpdateRequest",
+            "LogicalModelRecord",
+            "LogicalModelList",
+            "LogicalModelMutation",
+            "ModelCandidateCreateRequest",
+            "ModelCandidateUpdateRequest",
+            "ModelCandidateRecord",
+            "ModelCandidateList",
+            "ModelCandidateMutation",
+            "ConfigurationStatus",
+            "ConfigurationRebuildResult",
             "ErrorEnvelope",
         ):
             with self.subTest(schema_name=schema_name):
                 self.assertIn(schema_name, schemas)
+
+    def test_dynamic_admin_mutations_and_credentials_are_explicit(self) -> None:
+        for path, method in (
+            ("/admin/v1/providers", "post"),
+            ("/admin/v1/providers/{provider_id}", "patch"),
+            ("/admin/v1/providers/{provider_id}", "delete"),
+            ("/admin/v1/models", "post"),
+            ("/admin/v1/models/{model_id}", "patch"),
+            ("/admin/v1/models/{model_id}", "delete"),
+            ("/admin/v1/candidates", "post"),
+            ("/admin/v1/candidates/{candidate_id}", "patch"),
+            ("/admin/v1/candidates/{candidate_id}", "delete"),
+            ("/admin/v1/configuration/rebuild", "post"),
+        ):
+            with self.subTest(path=path, method=method):
+                operation = self.contract["paths"][path][method]
+                self.assertIn("202", operation["responses"])
+
+        schemas = self.contract["components"]["schemas"]
+        self.assertTrue(
+            schemas["ProviderCreateRequest"]["properties"]["credential"]["writeOnly"]
+        )
+        self.assertTrue(
+            schemas["ProviderUpdateRequest"]["properties"]["credential"]["writeOnly"]
+        )
+        self.assertNotIn("credential", schemas["ProviderRecord"]["properties"])
+
+    def test_route_contracts_expose_snapshot_and_provider_connection(self) -> None:
+        schemas = self.contract["components"]["schemas"]
+        expected = {
+            "RouteMetadata": {"provider_connection_id", "provider_protocol"},
+            "RouteDecision": {
+                "selected_provider_connection_id",
+                "selected_provider_protocol",
+            },
+            "UsageEvent": {"provider_connection_id", "provider_protocol"},
+        }
+        for model_name, provider_fields in expected.items():
+            with self.subTest(model_name=model_name):
+                required = set(schemas[model_name]["required"])
+                self.assertIn("configuration_version", required)
+                self.assertTrue(provider_fields <= required)
 
     def test_response_format_documents_draft_2020_12_validation(self) -> None:
         schema = self.contract["components"]["schemas"]["ResponseFormat"]
@@ -266,6 +347,44 @@ class OpenAPIContractTest(unittest.TestCase):
         self._assert_response_model(
             "AuditEventList",
             client.get("/admin/v1/audit-events", headers=admin_headers),
+        )
+        provider_id = self.app.state.configuration_repository.list_providers()[0].id
+        candidate_id = self.app.state.configuration_repository.list_candidates()[0].id
+        version = self.app.state.snapshot_store.active_version()
+        self._assert_response_model(
+            "ProviderList",
+            client.get("/admin/v1/providers", headers=admin_headers),
+        )
+        self._assert_response_model(
+            "ProviderRecord",
+            client.get(f"/admin/v1/providers/{provider_id}", headers=admin_headers),
+        )
+        self.assertNotIn(
+            "credential",
+            client.get(f"/admin/v1/providers/{provider_id}", headers=admin_headers).json(),
+        )
+        self._assert_response_model(
+            "LogicalModelList",
+            client.get("/admin/v1/models", headers=admin_headers),
+        )
+        self._assert_response_model(
+            "LogicalModelRecord",
+            client.get("/admin/v1/models/mixapi/balanced-chat", headers=admin_headers),
+        )
+        self._assert_response_model(
+            "ModelCandidateList",
+            client.get("/admin/v1/candidates", headers=admin_headers),
+        )
+        self._assert_response_model(
+            "ModelCandidateRecord",
+            client.get(f"/admin/v1/candidates/{candidate_id}", headers=admin_headers),
+        )
+        self._assert_response_model(
+            "ConfigurationStatus",
+            client.get(
+                f"/admin/v1/configuration/versions/{version}",
+                headers=admin_headers,
+            ),
         )
 
     def _assert_response_model(self, model_name: str, response) -> None:

@@ -1,0 +1,11 @@
+{
+  "name": "vendor-a",
+  "protocol": "gemini",
+  "base_url": "https://generativelanguage.googleapis.com",
+  "credential": "secret-provider-key",
+  "timeout_seconds": 30,
+  "status": "active",
+  "priority": 10,
+  "weight": 2,
+  "metadata": {"latency_ms": "100", "reliability": "0.99"}
+}

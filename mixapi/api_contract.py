@@ -129,6 +129,10 @@ class RejectedCandidate(ContractModel):
 class RouteMetadata(ContractModel):
     attempts: int = Field(ge=1)
     fallback_used: bool
+    configuration_version: int = Field(gt=0)
+    provider_connection_id: str
+    provider_name: str
+    provider_protocol: str
     selected_provider_model: str
     failed_attempts: list[FailedAttempt]
     decision_trace_id: str
@@ -205,7 +209,10 @@ class RouteDecision(ContractModel):
     endpoint: str
     logical_model: str
     status: str
+    configuration_version: int = Field(gt=0)
     selected_provider: str | None
+    selected_provider_connection_id: str | None
+    selected_provider_protocol: str | None
     selected_provider_model: str | None
     attempts: list[RouteAttempt]
     rejected_candidates: list[RejectedCandidate]
@@ -219,7 +226,10 @@ class UsageEvent(ContractModel):
     api_key_id: str
     endpoint: str
     logical_model: str
+    configuration_version: int = Field(gt=0)
     provider: str
+    provider_connection_id: str
+    provider_protocol: str
     provider_model: str
     input_tokens: int = Field(ge=0)
     output_tokens: int = Field(ge=0)
@@ -324,6 +334,213 @@ class AuditEventList(ContractModel):
     data: list[AuditEvent]
 
 
+ProviderProtocol = Literal["openai-compatible", "anthropic", "gemini", "ollama"]
+ConfigurationResourceStatus = Literal["active", "disabled", "deleted"]
+
+
+class ConfigurationVersionSummary(ContractModel):
+    version: int = Field(gt=0)
+    status: Literal["pending", "published", "failed"]
+    created_at: datetime
+
+
+class ProviderCreateRequest(ContractModel):
+    name: str = Field(min_length=1, max_length=200)
+    protocol: ProviderProtocol
+    base_url: str = Field(min_length=1, max_length=2048)
+    credential: str = Field(json_schema_extra={"writeOnly": True})
+    timeout_seconds: str | int | float = 30
+    status: Literal["active", "disabled"] = "active"
+    priority: int = 100
+    weight: int = Field(default=1, gt=0)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProviderUpdateRequest(ContractModel):
+    expected_updated_at: datetime
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    protocol: ProviderProtocol | None = None
+    base_url: str | None = Field(default=None, min_length=1, max_length=2048)
+    credential: str | None = Field(
+        default=None,
+        json_schema_extra={"writeOnly": True},
+    )
+    timeout_seconds: str | int | float | None = None
+    status: Literal["active", "disabled"] | None = None
+    priority: int | None = None
+    weight: int | None = Field(default=None, gt=0)
+    metadata: dict[str, Any] | None = None
+
+
+class ProviderRecord(ContractModel):
+    id: str
+    name: str
+    protocol: ProviderProtocol
+    base_url: str
+    timeout_seconds: str
+    status: ConfigurationResourceStatus
+    priority: int
+    weight: int = Field(gt=0)
+    metadata: dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+    deleted_at: datetime | None
+    credential_configured: bool
+    credential_key_version: int = Field(gt=0)
+    credential_fingerprint: str
+
+
+class ProviderList(ContractModel):
+    object: Literal["list"]
+    data: list[ProviderRecord]
+
+
+class ProviderMutation(ContractModel):
+    provider: ProviderRecord
+    configuration_version: ConfigurationVersionSummary
+
+
+class ProviderTestResult(ContractModel):
+    status: Literal["ok", "error"]
+    latency_ms: int = Field(ge=0)
+    error_class: str | None
+
+
+class LogicalModelCreateRequest(ContractModel):
+    id: str = Field(min_length=1, max_length=200)
+    description: str = ""
+    aliases: list[str] = Field(default_factory=list)
+    status: Literal["active", "disabled"] = "disabled"
+
+
+class LogicalModelUpdateRequest(ContractModel):
+    expected_updated_at: datetime
+    description: str | None = None
+    aliases: list[str] | None = None
+    status: Literal["active", "disabled"] | None = None
+
+
+class LogicalModelRecord(ContractModel):
+    id: str
+    description: str
+    status: ConfigurationResourceStatus
+    aliases: list[str]
+    created_at: datetime
+    updated_at: datetime
+    deleted_at: datetime | None
+
+
+class LogicalModelList(ContractModel):
+    object: Literal["list"]
+    data: list[LogicalModelRecord]
+
+
+class LogicalModelMutation(ContractModel):
+    logical_model: LogicalModelRecord
+    configuration_version: ConfigurationVersionSummary
+
+
+class ModelCandidateCreateRequest(ContractModel):
+    logical_model_id: str
+    provider_connection_id: str
+    upstream_model_id: str
+    status: Literal["active", "disabled"] = "active"
+    priority: int = 100
+    weight: int = Field(default=1, gt=0)
+    context_window_tokens: int = Field(gt=0)
+    max_output_tokens: int = Field(ge=0)
+    input_modalities: list[str] = Field(default_factory=list)
+    output_modalities: list[str] = Field(default_factory=list)
+    tool_modes: list[str] = Field(default_factory=list)
+    schema_support: Literal[
+        "none", "json_mode", "best_effort_schema", "strict_json_schema"
+    ] = "none"
+    streaming_support: bool = False
+    embeddings_support: bool = False
+    retention_class: str = "standard"
+    regions: list[str] = Field(default_factory=list)
+    pricing: dict[str, Any] = Field(default_factory=dict)
+    native_features: list[str] = Field(default_factory=list)
+    unsupported_parameters: list[str] = Field(default_factory=list)
+
+
+class ModelCandidateUpdateRequest(ContractModel):
+    expected_updated_at: datetime
+    logical_model_id: str | None = None
+    provider_connection_id: str | None = None
+    upstream_model_id: str | None = None
+    status: Literal["active", "disabled"] | None = None
+    priority: int | None = None
+    weight: int | None = Field(default=None, gt=0)
+    context_window_tokens: int | None = Field(default=None, gt=0)
+    max_output_tokens: int | None = Field(default=None, ge=0)
+    input_modalities: list[str] | None = None
+    output_modalities: list[str] | None = None
+    tool_modes: list[str] | None = None
+    schema_support: Literal[
+        "none", "json_mode", "best_effort_schema", "strict_json_schema"
+    ] | None = None
+    streaming_support: bool | None = None
+    embeddings_support: bool | None = None
+    retention_class: str | None = None
+    regions: list[str] | None = None
+    pricing: dict[str, Any] | None = None
+    native_features: list[str] | None = None
+    unsupported_parameters: list[str] | None = None
+
+
+class ModelCandidateRecord(ContractModel):
+    id: str
+    logical_model_id: str
+    provider_connection_id: str
+    upstream_model_id: str
+    status: ConfigurationResourceStatus
+    priority: int
+    weight: int = Field(gt=0)
+    context_window_tokens: int = Field(gt=0)
+    max_output_tokens: int = Field(ge=0)
+    input_modalities: list[str]
+    output_modalities: list[str]
+    tool_modes: list[str]
+    schema_support: str
+    streaming_support: bool
+    embeddings_support: bool
+    retention_class: str
+    regions: list[str]
+    pricing: dict[str, Any]
+    native_features: list[str]
+    unsupported_parameters: list[str]
+    created_at: datetime
+    updated_at: datetime
+    deleted_at: datetime | None
+
+
+class ModelCandidateList(ContractModel):
+    object: Literal["list"]
+    data: list[ModelCandidateRecord]
+
+
+class ModelCandidateMutation(ContractModel):
+    candidate: ModelCandidateRecord
+    configuration_version: ConfigurationVersionSummary
+
+
+class ConfigurationStatus(ContractModel):
+    version: int = Field(gt=0)
+    status: Literal["pending", "published", "failed"]
+    checksum: str | None
+    error_code: str | None
+    error_message: str | None
+    created_at: datetime
+    published_at: datetime | None
+    failed_at: datetime | None
+
+
+class ConfigurationRebuildResult(ContractModel):
+    status: Literal["rebuilt", "current"]
+    active_version: int | None
+
+
 class ErrorDetail(ContractModel):
     type: str
     code: str
@@ -398,6 +615,25 @@ CONTRACT_MODEL_TYPES: tuple[type[ContractModel], ...] = (
     TenantPolicy,
     AuditEvent,
     AuditEventList,
+    ConfigurationVersionSummary,
+    ProviderCreateRequest,
+    ProviderUpdateRequest,
+    ProviderRecord,
+    ProviderList,
+    ProviderMutation,
+    ProviderTestResult,
+    LogicalModelCreateRequest,
+    LogicalModelUpdateRequest,
+    LogicalModelRecord,
+    LogicalModelList,
+    LogicalModelMutation,
+    ModelCandidateCreateRequest,
+    ModelCandidateUpdateRequest,
+    ModelCandidateRecord,
+    ModelCandidateList,
+    ModelCandidateMutation,
+    ConfigurationStatus,
+    ConfigurationRebuildResult,
     ErrorDetail,
     ErrorEnvelope,
     StreamErrorDetail,
@@ -471,6 +707,94 @@ OPERATION_CONTRACTS: dict[tuple[str, str], OperationContract] = {
     ("/admin/v1/audit-events", "get"): OperationContract(
         "listAuditEvents",
         "AuditEventList",
+    ),
+    ("/admin/v1/providers", "post"): OperationContract(
+        "createProviderConnection",
+        "ProviderMutation",
+        "ProviderCreateRequest",
+        success_status="202",
+    ),
+    ("/admin/v1/providers", "get"): OperationContract(
+        "listProviderConnections",
+        "ProviderList",
+    ),
+    ("/admin/v1/providers/{provider_id}", "get"): OperationContract(
+        "getProviderConnection",
+        "ProviderRecord",
+    ),
+    ("/admin/v1/providers/{provider_id}", "patch"): OperationContract(
+        "updateProviderConnection",
+        "ProviderMutation",
+        "ProviderUpdateRequest",
+        success_status="202",
+    ),
+    ("/admin/v1/providers/{provider_id}", "delete"): OperationContract(
+        "deleteProviderConnection",
+        "ProviderMutation",
+        success_status="202",
+    ),
+    ("/admin/v1/providers/{provider_id}/test", "post"): OperationContract(
+        "testProviderConnection",
+        "ProviderTestResult",
+    ),
+    ("/admin/v1/models", "post"): OperationContract(
+        "createLogicalModel",
+        "LogicalModelMutation",
+        "LogicalModelCreateRequest",
+        success_status="202",
+    ),
+    ("/admin/v1/models", "get"): OperationContract(
+        "listLogicalModels",
+        "LogicalModelList",
+    ),
+    ("/admin/v1/models/{model_id}", "get"): OperationContract(
+        "getLogicalModel",
+        "LogicalModelRecord",
+    ),
+    ("/admin/v1/models/{model_id}", "patch"): OperationContract(
+        "updateLogicalModel",
+        "LogicalModelMutation",
+        "LogicalModelUpdateRequest",
+        success_status="202",
+    ),
+    ("/admin/v1/models/{model_id}", "delete"): OperationContract(
+        "deleteLogicalModel",
+        "LogicalModelMutation",
+        success_status="202",
+    ),
+    ("/admin/v1/candidates", "post"): OperationContract(
+        "createModelCandidate",
+        "ModelCandidateMutation",
+        "ModelCandidateCreateRequest",
+        success_status="202",
+    ),
+    ("/admin/v1/candidates", "get"): OperationContract(
+        "listModelCandidates",
+        "ModelCandidateList",
+    ),
+    ("/admin/v1/candidates/{candidate_id}", "get"): OperationContract(
+        "getModelCandidate",
+        "ModelCandidateRecord",
+    ),
+    ("/admin/v1/candidates/{candidate_id}", "patch"): OperationContract(
+        "updateModelCandidate",
+        "ModelCandidateMutation",
+        "ModelCandidateUpdateRequest",
+        success_status="202",
+    ),
+    ("/admin/v1/candidates/{candidate_id}", "delete"): OperationContract(
+        "deleteModelCandidate",
+        "ModelCandidateMutation",
+        success_status="202",
+    ),
+    ("/admin/v1/configuration/versions/{version}", "get"): OperationContract(
+        "getConfigurationVersion",
+        "ConfigurationStatus",
+    ),
+    ("/admin/v1/configuration/rebuild", "post"): OperationContract(
+        "rebuildConfiguration",
+        "ConfigurationRebuildResult",
+        success_status="202",
     ),
 }
 

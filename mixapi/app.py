@@ -718,6 +718,10 @@ def create_app(
             "route": {
                 "attempts": len(failed_attempts) + 1,
                 "fallback_used": bool(failed_attempts),
+                "configuration_version": configuration_version,
+                "provider_connection_id": selected_candidate.provider_connection_id,
+                "provider_name": selected_candidate.provider,
+                "provider_protocol": selected_candidate.protocol,
                 "selected_provider_model": selected_candidate.provider_model_id,
                 "failed_attempts": failed_attempts,
                 "decision_trace_id": request.state.request_id,
@@ -938,6 +942,10 @@ def create_app(
             "route": {
                 "attempts": len(failed_attempts) + 1,
                 "fallback_used": bool(failed_attempts),
+                "configuration_version": configuration_version,
+                "provider_connection_id": selected_candidate.provider_connection_id,
+                "provider_name": selected_candidate.provider,
+                "provider_protocol": selected_candidate.protocol,
                 "selected_provider_model": selected_candidate.provider_model_id,
                 "failed_attempts": failed_attempts,
                 "decision_trace_id": request.state.request_id,
@@ -1740,6 +1748,7 @@ def _native_response_event_stream(
         failed_attempts=failed_attempts,
         rejected_candidates=rejected_candidates,
         request_id=request_id,
+        configuration_version=configuration_version,
     )
     yield encode_sse("response.completed", {"response": response_payload})
 
@@ -1979,6 +1988,7 @@ def _response_payload(
     failed_attempts: list[dict[str, str]],
     rejected_candidates,
     request_id: str,
+    configuration_version: int,
 ) -> dict[str, Any]:
     adapter_response = AdapterResponse(
         output_text=output_text,
@@ -2008,6 +2018,10 @@ def _response_payload(
         "route": {
             "attempts": len(failed_attempts) + 1,
             "fallback_used": bool(failed_attempts),
+            "configuration_version": configuration_version,
+            "provider_connection_id": selected_candidate.provider_connection_id,
+            "provider_name": selected_candidate.provider,
+            "provider_protocol": selected_candidate.protocol,
             "selected_provider_model": selected_candidate.provider_model_id,
             "failed_attempts": failed_attempts,
             "decision_trace_id": request_id,

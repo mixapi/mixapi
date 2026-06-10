@@ -1,0 +1,22 @@
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "provider_vendor_a",
+      "name": "vendor-a",
+      "protocol": "gemini",
+      "base_url": "https://generativelanguage.googleapis.com",
+      "timeout_seconds": "30",
+      "status": "active",
+      "priority": 10,
+      "weight": 2,
+      "metadata": {"latency_ms": "100", "reliability": "0.99"},
+      "created_at": "2026-06-10T12:00:00Z",
+      "updated_at": "2026-06-10T12:00:00Z",
+      "deleted_at": null,
+      "credential_configured": true,
+      "credential_key_version": 1,
+      "credential_fingerprint": "0123456789abcdef"
+    }
+  ]
+}

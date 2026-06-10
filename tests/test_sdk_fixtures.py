@@ -73,6 +73,14 @@ class SDKFixturesTest(unittest.TestCase):
         self.assertEqual(error["error"]["type"], "structured_output_error")
         self.assertEqual(error["error"]["code"], "schema_validation_failed")
 
+    def test_provider_response_fixture_never_contains_plaintext_credentials(self) -> None:
+        provider = json.loads(
+            (FIXTURE_ROOT / "responses" / "provider-record.json").read_text()
+        )
+
+        self.assertNotIn("credential", provider)
+        self.assertTrue(provider["credential_configured"])
+
 
 if __name__ == "__main__":
     unittest.main()

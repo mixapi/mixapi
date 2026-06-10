@@ -17,7 +17,7 @@ def create_publication_router(
     snapshots: RedisSnapshotStore,
     authenticate_admin: Callable[..., AdminPrincipal],
 ) -> APIRouter:
-    router = APIRouter(prefix="/admin/v1/configuration", include_in_schema=False)
+    router = APIRouter(prefix="/admin/v1/configuration")
 
     @router.get("/versions/{version}")
     def get_version(version: int, _admin=Depends(authenticate_admin)):

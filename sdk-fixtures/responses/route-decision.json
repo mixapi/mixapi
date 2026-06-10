@@ -5,7 +5,10 @@
   "endpoint": "responses",
   "logical_model": "mixapi/balanced-chat",
   "status": "succeeded",
+  "configuration_version": 42,
   "selected_provider": "openai",
+  "selected_provider_connection_id": "provider_openai",
+  "selected_provider_protocol": "openai-compatible",
   "selected_provider_model": "gpt-4.1-mini",
   "attempts": [
     {"provider": "openai", "provider_model": "gpt-4.1-mini", "status": "succeeded"}

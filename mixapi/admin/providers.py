@@ -51,7 +51,7 @@ def create_provider_router(
     authenticate_admin: Callable[..., AdminPrincipal],
     tester: ProviderConnectionTester,
 ) -> APIRouter:
-    router = APIRouter(prefix="/admin/v1/providers", include_in_schema=False)
+    router = APIRouter(prefix="/admin/v1/providers")
 
     @router.post("", status_code=202)
     def create_provider(

@@ -1,0 +1,32 @@
+{
+  "candidate": {
+    "id": "candidate_vendor_a",
+    "logical_model_id": "gpt-5.5",
+    "provider_connection_id": "provider_vendor_a",
+    "upstream_model_id": "gemini-2.5-pro",
+    "status": "active",
+    "priority": 10,
+    "weight": 2,
+    "context_window_tokens": 1048576,
+    "max_output_tokens": 65536,
+    "input_modalities": ["text", "image"],
+    "output_modalities": ["text"],
+    "tool_modes": ["function"],
+    "schema_support": "strict_json_schema",
+    "streaming_support": true,
+    "embeddings_support": false,
+    "retention_class": "standard",
+    "regions": ["us"],
+    "pricing": {"input_per_million": "1.25", "output_per_million": "10"},
+    "native_features": ["thinking"],
+    "unsupported_parameters": [],
+    "created_at": "2026-06-10T12:00:00Z",
+    "updated_at": "2026-06-10T12:00:00Z",
+    "deleted_at": null
+  },
+  "configuration_version": {
+    "version": 42,
+    "status": "pending",
+    "created_at": "2026-06-10T12:00:00Z"
+  }
+}

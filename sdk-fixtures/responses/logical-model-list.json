@@ -1,0 +1,14 @@
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "gpt-5.5",
+      "description": "Portable reasoning model",
+      "status": "active",
+      "aliases": ["reasoning-latest"],
+      "created_at": "2026-06-10T12:00:00Z",
+      "updated_at": "2026-06-10T12:00:00Z",
+      "deleted_at": null
+    }
+  ]
+}

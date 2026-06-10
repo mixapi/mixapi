@@ -1,0 +1,6 @@
+{
+  "id": "gpt-5.5",
+  "description": "Portable reasoning model",
+  "aliases": ["reasoning-latest"],
+  "status": "disabled"
+}

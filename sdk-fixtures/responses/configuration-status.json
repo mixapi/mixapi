@@ -1,0 +1,10 @@
+{
+  "version": 42,
+  "status": "published",
+  "checksum": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "error_code": null,
+  "error_message": null,
+  "created_at": "2026-06-10T12:00:00Z",
+  "published_at": "2026-06-10T12:00:01Z",
+  "failed_at": null
+}
