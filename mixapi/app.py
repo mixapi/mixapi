@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 import os
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -53,6 +54,7 @@ from mixapi.errors import (
 from mixapi.idempotency import InMemoryIdempotencyStore
 from mixapi.models import ProviderModel
 from mixapi.observability import InMemoryObservability, Observability, SafeObservability
+from mixapi.postgres import PostgresPool
 from mixapi.persistence import (
     SQLiteBudgetService,
     SQLiteCircuitBreaker,
@@ -63,6 +65,7 @@ from mixapi.persistence import (
     SQLiteUsageLedger,
 )
 from mixapi.quota import InMemoryQuotaService, QuotaService, TokenReservation
+from mixapi.redis_runtime import RedisRuntime
 from mixapi.route_decisions import InMemoryRouteDecisionStore, RouteDecisionRecord
 from mixapi.routing import plan_route
 from mixapi.streaming import encode_sse
@@ -73,6 +76,7 @@ from mixapi.structured_output import (
     response_schema,
     validate_output,
 )
+from mixapi.settings import Settings
 from mixapi.usage import (
     InMemoryUsageLedger,
     UsageEvent,
@@ -106,8 +110,27 @@ def create_app(
     token_quota_limit: int | None = None,
     admin_api_key: str | None = None,
     observability: Observability | None = None,
+    settings: Settings | None = None,
 ) -> FastAPI:
-    app = FastAPI(title="MixAPI", version="0.1.0")
+    configured_settings = settings or Settings.from_env()
+    postgres_pool = PostgresPool(configured_settings)
+    redis_runtime = RedisRuntime(configured_settings)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        postgres_pool.open()
+        try:
+            redis_runtime.open()
+        except Exception:
+            postgres_pool.close()
+            raise
+        try:
+            yield
+        finally:
+            redis_runtime.close()
+            postgres_pool.close()
+
+    app = FastAPI(title="MixAPI", version="0.1.0", lifespan=lifespan)
     catalog = default_catalog()
     deterministic_adapter = DeterministicProviderAdapter(
         failed_response_providers=failed_response_providers
@@ -175,7 +198,7 @@ def create_app(
     control_plane = (
         SQLiteControlPlaneStore(database) if database else InMemoryControlPlaneStore()
     )
-    configured_admin_api_key = admin_api_key or os.getenv("MIXAPI_ADMIN_KEY")
+    configured_admin_api_key = admin_api_key or configured_settings.admin_api_key
     authenticate_admin = build_admin_authenticator(configured_admin_api_key)
     authenticate_service = build_service_authenticator(control_plane)
     budget = (
@@ -211,6 +234,9 @@ def create_app(
     app.state.circuits = circuits
     app.state.control_plane = control_plane
     app.state.observability = observability
+    app.state.settings = configured_settings
+    app.state.postgres_pool = postgres_pool
+    app.state.redis_runtime = redis_runtime
 
     @app.middleware("http")
     async def attach_request_context(request: Request, call_next):
@@ -868,11 +894,6 @@ def create_app(
 
     install_openapi_contract(app)
     return app
-
-
-app = create_app()
-
-
 @dataclass(frozen=True)
 class BillableDispatch:
     candidate: ProviderModel

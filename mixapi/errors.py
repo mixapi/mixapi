@@ -101,6 +101,30 @@ def provider_unavailable(code: str, message: str) -> MixAPIError:
     )
 
 
+def control_plane_unavailable(
+    code: str = "control_plane_unavailable",
+    message: str = "The control plane is temporarily unavailable.",
+) -> MixAPIError:
+    return MixAPIError(
+        type="control_plane_unavailable",
+        code=code,
+        message=message,
+        status_code=503,
+    )
+
+
+def configuration_unavailable(
+    code: str = "configuration_unavailable",
+    message: str = "The active routing configuration is unavailable.",
+) -> MixAPIError:
+    return MixAPIError(
+        type="configuration_unavailable",
+        code=code,
+        message=message,
+        status_code=503,
+    )
+
+
 def provider_rate_limited(code: str, message: str) -> MixAPIError:
     return MixAPIError(
         type="provider_rate_limited",
