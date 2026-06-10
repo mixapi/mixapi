@@ -48,7 +48,7 @@ from mixapi.errors import (
     validation_error,
 )
 from mixapi.idempotency import InMemoryIdempotencyStore
-from mixapi.observability import InMemoryObservability, Observability
+from mixapi.observability import InMemoryObservability, Observability, SafeObservability
 from mixapi.persistence import (
     SQLiteBudgetService,
     SQLiteCircuitBreaker,
@@ -191,6 +191,7 @@ def create_app(
     )
     if observability is None:
         observability = InMemoryObservability()
+    instrumentation = SafeObservability(observability)
     app.state.usage_ledger = usage_ledger
     app.state.idempotency_store = idempotency_store
     app.state.route_decision_store = route_decision_store
@@ -247,7 +248,8 @@ def create_app(
         circuit_candidates, circuit_rejections = _circuit_eligible_candidates(
             decision.candidates,
             circuits,
-            observability,
+            instrumentation,
+            request.state.trace_id,
         )
         if not circuit_candidates:
             route_decision_store.record(
@@ -274,7 +276,7 @@ def create_app(
             endpoint="responses",
             budget=budget,
             principal=principal,
-            observability=observability,
+            observability=instrumentation,
             trace_id=request.state.trace_id,
         )
         rejected_candidates = (*decision.rejected, *circuit_rejections, *budget_rejections)
@@ -295,13 +297,13 @@ def create_app(
                         request_body=request_body,
                         candidates=candidates,
                         circuits=circuits,
-                        observability=observability,
+                        observability=instrumentation,
                         trace_id=request.state.trace_id,
                     )
                 )
             except AllCandidatesFailed as error:
                 _record_fallback_transitions(
-                    observability,
+                    instrumentation,
                     request.state.trace_id,
                     principal,
                     request_body["model"],
@@ -326,7 +328,7 @@ def create_app(
                 raise _public_error_for_failed_attempts(error.failed_attempts)
 
             _record_fallback_transitions(
-                observability,
+                instrumentation,
                 request.state.trace_id,
                 principal,
                 request_body["model"],
@@ -350,7 +352,7 @@ def create_app(
                     circuits=circuits,
                     usage_ledger=usage_ledger,
                     route_decision_store=route_decision_store,
-                    observability=observability,
+                    observability=instrumentation,
                     trace_id=request.state.trace_id,
                 ),
                 media_type="text/event-stream",
@@ -365,12 +367,12 @@ def create_app(
                 request_body=request_body,
                 candidates=candidates,
                 circuits=circuits,
-                observability=observability,
+                observability=instrumentation,
                 trace_id=request.state.trace_id,
             )
         except AllCandidatesFailed as error:
             _record_fallback_transitions(
-                observability,
+                instrumentation,
                 request.state.trace_id,
                 principal,
                 request_body["model"],
@@ -395,7 +397,7 @@ def create_app(
             raise _public_error_for_failed_attempts(error.failed_attempts)
 
         _record_fallback_transitions(
-            observability,
+            instrumentation,
             request.state.trace_id,
             principal,
             request_body["model"],
@@ -504,7 +506,8 @@ def create_app(
         circuit_candidates, circuit_rejections = _circuit_eligible_candidates(
             decision.candidates,
             circuits,
-            observability,
+            instrumentation,
+            request.state.trace_id,
         )
         if not circuit_candidates:
             route_decision_store.record(
@@ -531,7 +534,7 @@ def create_app(
             endpoint="embeddings",
             budget=budget,
             principal=principal,
-            observability=observability,
+            observability=instrumentation,
             trace_id=request.state.trace_id,
         )
         rejected_candidates = (*decision.rejected, *circuit_rejections, *budget_rejections)
@@ -550,12 +553,12 @@ def create_app(
                 request_body=request_body,
                 candidates=candidates,
                 circuits=circuits,
-                observability=observability,
+                observability=instrumentation,
                 trace_id=request.state.trace_id,
             )
         except AllCandidatesFailed as error:
             _record_fallback_transitions(
-                observability,
+                instrumentation,
                 request.state.trace_id,
                 principal,
                 request_body["model"],
@@ -580,7 +583,7 @@ def create_app(
             raise _public_error_for_failed_attempts(error.failed_attempts)
 
         _record_fallback_transitions(
-            observability,
+            instrumentation,
             request.state.trace_id,
             principal,
             request_body["model"],
@@ -905,13 +908,15 @@ def _circuit_eligible_candidates(
     candidates,
     circuits: CircuitBreaker,
     observability: Observability,
+    trace_id: str,
 ) -> tuple[tuple[Any, ...], tuple[dict[str, str], ...]]:
     eligible: list[Any] = []
     rejected: list[dict[str, str]] = []
     for candidate in candidates:
         is_open = circuits.is_open(candidate.provider, candidate.provider_model_id)
-        _set_circuit_gauge(
+        _record_circuit_observation(
             observability,
+            trace_id,
             candidate.provider,
             candidate.provider_model_id,
             is_open,
@@ -1602,11 +1607,26 @@ def _record_circuit_state(
     provider_model: str,
 ) -> None:
     is_open = circuits.is_open(provider, provider_model)
-    _set_circuit_gauge(
+    _record_circuit_observation(
         observability,
+        trace_id,
         provider,
         provider_model,
         is_open,
+    )
+
+
+def _record_circuit_observation(
+    observability: Observability,
+    trace_id: str,
+    provider: str,
+    provider_model: str,
+    is_open: bool,
+) -> None:
+    observability.set_gauge(
+        "mixapi_circuit_state",
+        int(is_open),
+        {"provider": provider, "provider_model": provider_model},
     )
     observability.record_span(
         "circuit.state",
@@ -1618,19 +1638,6 @@ def _record_circuit_state(
             "provider_model": provider_model,
             "state": "open" if is_open else "closed",
         },
-    )
-
-
-def _set_circuit_gauge(
-    observability: Observability,
-    provider: str,
-    provider_model: str,
-    is_open: bool,
-) -> None:
-    observability.set_gauge(
-        "mixapi_circuit_state",
-        int(is_open),
-        {"provider": provider, "provider_model": provider_model},
     )
 
 

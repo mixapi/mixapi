@@ -69,6 +69,28 @@ class ObservabilityCollectorTest(unittest.TestCase):
         self.assertEqual(span.duration_ms, 4.25)
         self.assertNotIn("input", dict(span.attributes))
 
+    def test_event_retention_is_bounded(self) -> None:
+        observability = InMemoryObservability(max_records=2)
+
+        for index in range(3):
+            observability.observe_histogram("latency", index, {})
+            observability.record_span(
+                "provider.dispatch",
+                trace_id=f"trace_{index}",
+                status="ok",
+                duration_ms=index,
+                attributes={},
+            )
+
+        self.assertEqual(
+            [sample.value for sample in observability.histogram_samples()],
+            [1, 2],
+        )
+        self.assertEqual(
+            [span.trace_id for span in observability.spans()],
+            ["trace_1", "trace_2"],
+        )
+
 
 class ObservabilityEndpointTest(unittest.TestCase):
     def test_successful_response_records_provider_latency_and_trace_span(self) -> None:
@@ -228,6 +250,50 @@ class ObservabilityEndpointTest(unittest.TestCase):
             )
         )
 
+    def test_open_circuit_rejection_uses_current_request_trace(self) -> None:
+        app = create_app(
+            failed_response_providers={"ollama"},
+            circuit_failure_threshold=1,
+        )
+        client = TestClient(app)
+        request_body = {
+            "model": "mixapi/balanced-chat",
+            "input": "Circuit rejection trace",
+            "native": {"provider": "ollama"},
+        }
+
+        client.post("/v1/responses", headers=AUTH_HEADERS, json=request_body)
+        response = client.post(
+            "/v1/responses",
+            headers={**AUTH_HEADERS, "traceparent": "trace_open_circuit"},
+            json=request_body,
+        )
+
+        self.assertEqual(response.status_code, 503)
+        spans = [
+            span
+            for span in _spans(app, "circuit.state")
+            if span.trace_id == "trace_open_circuit"
+        ]
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(dict(spans[0].attributes)["state"], "open")
+
+    def test_instrumentation_failure_does_not_change_response(self) -> None:
+        app = create_app(observability=ExplodingObservability())
+        client = TestClient(app)
+
+        response = client.post(
+            "/v1/responses",
+            headers=AUTH_HEADERS,
+            json={
+                "model": "mixapi/balanced-chat",
+                "input": "Exporter failure",
+                "native": {"provider": "openai"},
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+
     def test_request_budget_denial_records_metric_and_failed_span(self) -> None:
         app = create_app()
         client = TestClient(app)
@@ -292,6 +358,20 @@ def _metric_samples(app, kind: str, name: str):
 
 def _spans(app, name: str):
     return [span for span in app.state.observability.spans() if span.name == name]
+
+
+class ExplodingObservability:
+    def increment_counter(self, *args, **kwargs) -> None:
+        raise RuntimeError("collector unavailable")
+
+    def observe_histogram(self, *args, **kwargs) -> None:
+        raise RuntimeError("collector unavailable")
+
+    def set_gauge(self, *args, **kwargs) -> None:
+        raise RuntimeError("collector unavailable")
+
+    def record_span(self, *args, **kwargs) -> None:
+        raise RuntimeError("collector unavailable")
 
 
 if __name__ == "__main__":

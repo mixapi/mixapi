@@ -4,7 +4,7 @@
 
 MixAPI will add a dependency-free observability boundary that records metrics and trace spans without choosing a deployment-specific backend. A new `mixapi.observability` module will define immutable metric and span records plus a thread-safe in-memory collector. `create_app` will accept an optional collector and expose the active collector through `app.state.observability`, matching the existing service-injection pattern for budgets, circuits, usage, and route decisions.
 
-The collector will expose counter, histogram, gauge, and span APIs. Metric labels will be normalized into sorted tuples so snapshots are deterministic and safe to assert in tests. Spans will carry the existing request trace ID, a name, status, duration, and low-cardinality attributes. Request or response bodies, API keys, and prompt text will never be captured. This keeps the records compatible with later OpenTelemetry or Prometheus adapters while avoiding a runtime dependency and exporter configuration in the gateway core.
+The collector will expose counter, histogram, gauge, and span APIs. Metric labels will be normalized into sorted tuples so snapshots are deterministic and safe to assert in tests. Spans will carry the existing request trace ID, a name, status, duration, and low-cardinality attributes. Request or response bodies, API keys, and prompt text will never be captured. In-memory event retention is bounded, and a safety wrapper prevents exporter failures from changing API behavior. This keeps the records compatible with later OpenTelemetry or Prometheus adapters while avoiding a runtime dependency and exporter configuration in the gateway core.
 
 ## Data Flow
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from threading import Lock
 from typing import Mapping, Protocol
@@ -58,13 +59,71 @@ class Observability(Protocol):
     ) -> None: ...
 
 
+@dataclass(frozen=True)
+class SafeObservability:
+    delegate: Observability
+
+    def increment_counter(
+        self,
+        name: str,
+        labels: Mapping[str, object],
+        amount: float = 1,
+    ) -> None:
+        try:
+            self.delegate.increment_counter(name, labels, amount)
+        except Exception:
+            pass
+
+    def observe_histogram(
+        self,
+        name: str,
+        value: float,
+        labels: Mapping[str, object],
+    ) -> None:
+        try:
+            self.delegate.observe_histogram(name, value, labels)
+        except Exception:
+            pass
+
+    def set_gauge(
+        self,
+        name: str,
+        value: float,
+        labels: Mapping[str, object],
+    ) -> None:
+        try:
+            self.delegate.set_gauge(name, value, labels)
+        except Exception:
+            pass
+
+    def record_span(
+        self,
+        name: str,
+        trace_id: str,
+        status: str,
+        duration_ms: float,
+        attributes: Mapping[str, AttributeValue],
+    ) -> None:
+        try:
+            self.delegate.record_span(name, trace_id, status, duration_ms, attributes)
+        except Exception:
+            pass
+
+
 @dataclass
 class InMemoryObservability:
+    max_records: int = 10_000
     _counters: dict[tuple[str, Labels], float] = field(default_factory=dict)
-    _histograms: list[MetricSample] = field(default_factory=list)
+    _histograms: deque[MetricSample] = field(init=False)
     _gauges: dict[tuple[str, Labels], float] = field(default_factory=dict)
-    _spans: list[SpanRecord] = field(default_factory=list)
+    _spans: deque[SpanRecord] = field(init=False)
     _lock: Lock = field(default_factory=Lock, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.max_records <= 0:
+            raise ValueError("max_records must be positive")
+        self._histograms = deque(maxlen=self.max_records)
+        self._spans = deque(maxlen=self.max_records)
 
     def increment_counter(
         self,
