@@ -4,6 +4,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from mixapi.api_contract import CONTRACT_MODELS
 from mixapi.app import create_app
 
 
@@ -127,6 +128,32 @@ class OpenAPIContractTest(unittest.TestCase):
             {"type": "string"},
         )
 
+    def test_supported_request_headers_are_documented(self) -> None:
+        for path, method in (
+            ("/v1/models", "get"),
+            ("/v1/responses", "post"),
+            ("/admin/v1/api-keys", "get"),
+        ):
+            with self.subTest(path=path, method=method):
+                header_names = {
+                    parameter["name"]
+                    for parameter in self.contract["paths"][path][method].get(
+                        "parameters", []
+                    )
+                    if parameter["in"] == "header"
+                }
+                self.assertIn("X-Request-ID", header_names)
+                self.assertIn("traceparent", header_names)
+                self.assertNotIn("authorization", {name.lower() for name in header_names})
+
+        for path in ("/v1/responses", "/v1/embeddings"):
+            header_names = {
+                parameter["name"]
+                for parameter in self.contract["paths"][path]["post"]["parameters"]
+                if parameter["in"] == "header"
+            }
+            self.assertIn("Idempotency-Key", header_names)
+
     def test_openapi_endpoint_serves_the_application_contract(self) -> None:
         response = TestClient(self.app).get("/openapi.json")
 
@@ -137,6 +164,88 @@ class OpenAPIContractTest(unittest.TestCase):
         expected = json.dumps(self.contract, indent=2, sort_keys=True) + "\n"
 
         self.assertEqual((ROOT / "openapi" / "openapi.json").read_text(), expected)
+
+    def test_live_json_responses_conform_to_contract_models(self) -> None:
+        client = TestClient(self.app)
+        service_headers = {
+            "Authorization": "Bearer dev-key",
+            "X-Request-ID": "req_contract_live",
+        }
+        admin_headers = {"Authorization": "Bearer admin-secret"}
+
+        self._assert_response_model(
+            "ModelList", client.get("/v1/models", headers=service_headers)
+        )
+        self._assert_response_model(
+            "ResponseObject",
+            client.post(
+                "/v1/responses",
+                headers=service_headers,
+                json={"model": "mixapi/balanced-chat", "input": "hello"},
+            ),
+        )
+        self._assert_response_model(
+            "EmbeddingList",
+            client.post(
+                "/v1/embeddings",
+                headers=service_headers,
+                json={"model": "mixapi/embedding-small", "input": "hello"},
+            ),
+        )
+        self._assert_response_model(
+            "RouteDecision",
+            client.get("/v1/route-decisions/req_contract_live", headers=service_headers),
+        )
+        self._assert_response_model(
+            "UsageList", client.get("/v1/usage", headers=service_headers)
+        )
+
+        created = client.post(
+            "/admin/v1/api-keys",
+            headers=admin_headers,
+            json={"tenant_id": "tenant_acme", "project_id": "project_chat"},
+        )
+        self._assert_response_model("ApiKeyCreated", created)
+        api_key_id = created.json()["id"]
+        self._assert_response_model(
+            "ApiKeyList", client.get("/admin/v1/api-keys", headers=admin_headers)
+        )
+        self._assert_response_model(
+            "ApiKeyRecord",
+            client.patch(
+                f"/admin/v1/api-keys/{api_key_id}",
+                headers=admin_headers,
+                json={"name": "renamed"},
+            ),
+        )
+        self._assert_response_model(
+            "ApiKeyRecord",
+            client.delete(f"/admin/v1/api-keys/{api_key_id}", headers=admin_headers),
+        )
+        self._assert_response_model(
+            "TenantPolicy",
+            client.put(
+                "/admin/v1/tenants/tenant_acme/model-allowlist",
+                headers=admin_headers,
+                json={"models": ["mixapi/balanced-chat"]},
+            ),
+        )
+        self._assert_response_model(
+            "TenantPolicy",
+            client.put(
+                "/admin/v1/tenants/tenant_acme/routing-policy",
+                headers=admin_headers,
+                json={"objective": "lowest-cost"},
+            ),
+        )
+        self._assert_response_model(
+            "AuditEventList",
+            client.get("/admin/v1/audit-events", headers=admin_headers),
+        )
+
+    def _assert_response_model(self, model_name: str, response) -> None:
+        self.assertLess(response.status_code, 300, response.text)
+        CONTRACT_MODELS[model_name].model_validate(response.json())
 
 
 if __name__ == "__main__":

@@ -1973,6 +1973,24 @@
               ],
               "title": "Tenant Id"
             }
+          },
+          {
+            "description": "Optional caller-provided request identifier.",
+            "in": "header",
+            "name": "X-Request-ID",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional distributed trace context.",
+            "in": "header",
+            "name": "traceparent",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -2079,6 +2097,26 @@
       },
       "post": {
         "operationId": "createApiKey",
+        "parameters": [
+          {
+            "description": "Optional caller-provided request identifier.",
+            "in": "header",
+            "name": "X-Request-ID",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional distributed trace context.",
+            "in": "header",
+            "name": "traceparent",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -2204,6 +2242,24 @@
               "title": "Api Key Id",
               "type": "string"
             }
+          },
+          {
+            "description": "Optional caller-provided request identifier.",
+            "in": "header",
+            "name": "X-Request-ID",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional distributed trace context.",
+            "in": "header",
+            "name": "traceparent",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -2317,6 +2373,24 @@
             "required": true,
             "schema": {
               "title": "Api Key Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional caller-provided request identifier.",
+            "in": "header",
+            "name": "X-Request-ID",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional distributed trace context.",
+            "in": "header",
+            "name": "traceparent",
+            "required": false,
+            "schema": {
               "type": "string"
             }
           }
@@ -2453,6 +2527,24 @@
               ],
               "title": "Tenant Id"
             }
+          },
+          {
+            "description": "Optional caller-provided request identifier.",
+            "in": "header",
+            "name": "X-Request-ID",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional distributed trace context.",
+            "in": "header",
+            "name": "traceparent",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -2568,6 +2660,24 @@
             "required": true,
             "schema": {
               "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional caller-provided request identifier.",
+            "in": "header",
+            "name": "X-Request-ID",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional distributed trace context.",
+            "in": "header",
+            "name": "traceparent",
+            "required": false,
+            "schema": {
               "type": "string"
             }
           }
@@ -2697,6 +2807,24 @@
               "title": "Tenant Id",
               "type": "string"
             }
+          },
+          {
+            "description": "Optional caller-provided request identifier.",
+            "in": "header",
+            "name": "X-Request-ID",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional distributed trace context.",
+            "in": "header",
+            "name": "traceparent",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -2815,6 +2943,35 @@
     "/v1/embeddings": {
       "post": {
         "operationId": "createEmbedding",
+        "parameters": [
+          {
+            "description": "Optional caller-provided request identifier.",
+            "in": "header",
+            "name": "X-Request-ID",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional distributed trace context.",
+            "in": "header",
+            "name": "traceparent",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Replays the original non-streaming response for repeated requests.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -2931,6 +3088,26 @@
     "/v1/models": {
       "get": {
         "operationId": "listModels",
+        "parameters": [
+          {
+            "description": "Optional caller-provided request identifier.",
+            "in": "header",
+            "name": "X-Request-ID",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional distributed trace context.",
+            "in": "header",
+            "name": "traceparent",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -3037,6 +3214,35 @@
     "/v1/responses": {
       "post": {
         "operationId": "createResponse",
+        "parameters": [
+          {
+            "description": "Optional caller-provided request identifier.",
+            "in": "header",
+            "name": "X-Request-ID",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional distributed trace context.",
+            "in": "header",
+            "name": "traceparent",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Replays the original non-streaming response for repeated requests.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -3178,6 +3384,24 @@
             "required": true,
             "schema": {
               "title": "Request Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional caller-provided request identifier.",
+            "in": "header",
+            "name": "X-Request-ID",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional distributed trace context.",
+            "in": "header",
+            "name": "traceparent",
+            "required": false,
+            "schema": {
               "type": "string"
             }
           }
@@ -3346,6 +3570,24 @@
               ],
               "title": "Cursor"
             }
+          },
+          {
+            "description": "Optional caller-provided request identifier.",
+            "in": "header",
+            "name": "X-Request-ID",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional distributed trace context.",
+            "in": "header",
+            "name": "traceparent",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -3495,6 +3737,24 @@
                 }
               ],
               "title": "End Time"
+            }
+          },
+          {
+            "description": "Optional caller-provided request identifier.",
+            "in": "header",
+            "name": "X-Request-ID",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional distributed trace context.",
+            "in": "header",
+            "name": "traceparent",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],

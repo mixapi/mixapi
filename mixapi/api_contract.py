@@ -498,8 +498,12 @@ def build_openapi_contract(app: FastAPI) -> dict[str, Any]:
             for parameter in operation.get("parameters", [])
             if parameter.get("name", "").lower() != "authorization"
         ]
-        if not operation["parameters"]:
-            operation.pop("parameters", None)
+        operation["parameters"].extend(
+            _request_header_parameters(
+                idempotency=path in {"/v1/responses", "/v1/embeddings"}
+                and method == "post"
+            )
+        )
         if operation_contract.request_model is not None:
             operation["requestBody"] = {
                 "required": True,
@@ -568,3 +572,33 @@ def _component_schemas() -> dict[str, Any]:
 
 def _schema_ref(model_name: str) -> dict[str, str]:
     return {"$ref": f"#/components/schemas/{model_name}"}
+
+
+def _request_header_parameters(*, idempotency: bool) -> list[dict[str, Any]]:
+    parameters: list[dict[str, Any]] = [
+        {
+            "name": "X-Request-ID",
+            "in": "header",
+            "required": False,
+            "description": "Optional caller-provided request identifier.",
+            "schema": {"type": "string"},
+        },
+        {
+            "name": "traceparent",
+            "in": "header",
+            "required": False,
+            "description": "Optional distributed trace context.",
+            "schema": {"type": "string"},
+        },
+    ]
+    if idempotency:
+        parameters.append(
+            {
+                "name": "Idempotency-Key",
+                "in": "header",
+                "required": False,
+                "description": "Replays the original non-streaming response for repeated requests.",
+                "schema": {"type": "string"},
+            }
+        )
+    return parameters
