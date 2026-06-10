@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any, Literal
 
 
@@ -29,8 +30,12 @@ class ProviderModel:
     native_features: tuple[str, ...] = ()
     unsupported_parameters: tuple[str, ...] = ()
     provider_connection_id: str | None = None
+    provider_connection_name: str | None = None
+    protocol: str | None = None
     priority: int = 100
     weight: int = 1
+    latency_ms: Decimal = Decimal("1000")
+    reliability: Decimal = Decimal("0")
 
 
 @dataclass(frozen=True)

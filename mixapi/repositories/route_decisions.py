@@ -20,9 +20,10 @@ class PostgresRouteDecisionStore:
                 INSERT INTO route_decisions (
                     tenant_id, request_id, project_id, endpoint, logical_model,
                     configuration_version, status,
-                    selected_provider_connection_id, selected_provider_protocol,
-                    selected_provider_model, attempts, rejected_candidates
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    selected_provider_connection_id, selected_provider_name,
+                    selected_provider_protocol, selected_provider_model,
+                    attempts, rejected_candidates
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (tenant_id, request_id) DO UPDATE SET
                     project_id = EXCLUDED.project_id,
                     endpoint = EXCLUDED.endpoint,
@@ -30,6 +31,7 @@ class PostgresRouteDecisionStore:
                     configuration_version = EXCLUDED.configuration_version,
                     status = EXCLUDED.status,
                     selected_provider_connection_id = EXCLUDED.selected_provider_connection_id,
+                    selected_provider_name = EXCLUDED.selected_provider_name,
                     selected_provider_protocol = EXCLUDED.selected_provider_protocol,
                     selected_provider_model = EXCLUDED.selected_provider_model,
                     attempts = EXCLUDED.attempts,
@@ -43,8 +45,9 @@ class PostgresRouteDecisionStore:
                     record.logical_model,
                     record.configuration_version,
                     record.status,
-                    record.selected_provider_connection_id or record.selected_provider,
+                    record.selected_provider_connection_id,
                     record.selected_provider,
+                    record.selected_provider_protocol,
                     record.selected_provider_model,
                     Jsonb(list(record.attempts)),
                     Jsonb(list(record.rejected_candidates)),
@@ -69,10 +72,11 @@ class PostgresRouteDecisionStore:
             endpoint=row["endpoint"],
             logical_model=row["logical_model"],
             status=row["status"],
-            selected_provider=row["selected_provider_protocol"],
+            selected_provider=row["selected_provider_name"],
             selected_provider_model=row["selected_provider_model"],
             attempts=tuple(row["attempts"]),
             rejected_candidates=tuple(row["rejected_candidates"]),
             selected_provider_connection_id=row["selected_provider_connection_id"],
+            selected_provider_protocol=row["selected_provider_protocol"],
             configuration_version=row["configuration_version"],
         ).public_dict()

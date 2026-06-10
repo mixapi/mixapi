@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
+import hashlib
+import math
 from typing import Any
 
+from mixapi.catalog import catalog_from_snapshot
 from mixapi.errors import capability_unsupported, permission_denied, validation_error
 from mixapi.models import LogicalModel, ProviderModel, SchemaSupport
+from mixapi.snapshots import ConfigurationSnapshot
 
 
 @dataclass(frozen=True)
@@ -14,25 +18,37 @@ class RouteDecision:
     candidates: tuple[ProviderModel, ...]
     rejected: tuple[dict[str, str], ...]
     score: Decimal
+    logical_model_id: str
 
 
 def plan_route(
-    catalog: dict[str, LogicalModel],
+    catalog: dict[str, LogicalModel] | ConfigurationSnapshot,
     request_body: dict[str, Any],
     endpoint: str,
     model_allowlist: tuple[str, ...] | None = None,
     default_objective: str | None = None,
+    selection_seed: str = "",
 ) -> RouteDecision:
-    logical_model_id = request_body.get("model")
-    if not isinstance(logical_model_id, str) or not logical_model_id:
+    requested_model = request_body.get("model")
+    if not isinstance(requested_model, str) or not requested_model:
         raise validation_error("model_required", "Request field `model` is required.")
-    if model_allowlist is not None and logical_model_id not in model_allowlist:
+    snapshot = catalog if isinstance(catalog, ConfigurationSnapshot) else None
+    if snapshot is not None:
+        logical_model_id = snapshot.resolve_model_id(requested_model)
+        runtime_catalog = catalog_from_snapshot(snapshot)
+    else:
+        logical_model_id = requested_model
+        runtime_catalog = catalog
+    if logical_model_id is None:
+        raise capability_unsupported("model_not_found", "No logical model matches the request.")
+    canonical_allowlist = _canonical_allowlist(snapshot, model_allowlist)
+    if canonical_allowlist is not None and logical_model_id not in canonical_allowlist:
         raise permission_denied(
             "model_not_allowed",
             "API key policy does not allow the requested model.",
         )
 
-    logical_model = catalog.get(logical_model_id)
+    logical_model = runtime_catalog.get(logical_model_id)
     if logical_model is None:
         raise capability_unsupported("model_not_found", "No logical model matches the request.")
 
@@ -66,13 +82,17 @@ def plan_route(
         code = _best_rejection_code(rejected)
         raise capability_unsupported(code, "No eligible provider supports the requested features.")
 
-    ordered = sorted(eligible, key=lambda item: (item[1], item[0].provider))
+    ordered = _ordered_candidates(
+        eligible,
+        selection_seed or logical_model_id,
+    )
     candidate, score = ordered[0]
     return RouteDecision(
         candidate=candidate,
         candidates=tuple(item[0] for item in ordered),
         rejected=tuple(rejected),
         score=score,
+        logical_model_id=logical_model_id,
     )
 
 
@@ -87,7 +107,11 @@ def _rejection_reason(
 ) -> str | None:
     if candidate.status != "active":
         return "model_disabled"
-    if provider_pin and candidate.provider != provider_pin:
+    if provider_pin and provider_pin not in {
+        candidate.provider,
+        candidate.provider_connection_id,
+        candidate.protocol,
+    }:
         return "provider_not_pinned"
     if endpoint == "embeddings" and not candidate.embeddings_support:
         return "embeddings_not_supported"
@@ -180,17 +204,54 @@ def _score_candidate(candidate: ProviderModel, objective: str) -> Decimal:
     cost = _token_cost(candidate)
     if objective == "lowest-cost":
         return cost
-    if objective == "lowest-latency" and candidate.provider == "ollama":
-        return Decimal("100")
-    if objective == "highest-reliability" and candidate.provider == "ollama":
-        return Decimal("10")
-    preference = {
-        "openai": Decimal("0.01"),
-        "anthropic": Decimal("0.02"),
-        "gemini": Decimal("0.03"),
-        "ollama": Decimal("0.04"),
-    }.get(candidate.provider, Decimal("1"))
-    return cost + preference
+    if objective == "lowest-latency":
+        return candidate.latency_ms
+    if objective == "highest-reliability":
+        return -candidate.reliability
+    return Decimal(candidate.priority)
+
+
+def _ordered_candidates(
+    eligible: list[tuple[ProviderModel, Decimal]],
+    selection_seed: str,
+) -> list[tuple[ProviderModel, Decimal]]:
+    buckets: dict[Decimal, list[tuple[ProviderModel, Decimal]]] = {}
+    for item in eligible:
+        buckets.setdefault(item[1], []).append(item)
+    ordered: list[tuple[ProviderModel, Decimal]] = []
+    for score in sorted(buckets):
+        ordered.extend(
+            sorted(
+                buckets[score],
+                key=lambda item: _rendezvous_rank(
+                    selection_seed,
+                    item[0],
+                ),
+            )
+        )
+    return ordered
+
+
+def _rendezvous_rank(seed: str, candidate: ProviderModel) -> float:
+    identity = candidate.provider_connection_id or candidate.id
+    digest = hashlib.sha256(f"{seed}:{identity}:{candidate.id}".encode("utf-8")).digest()
+    value = (int.from_bytes(digest[:8], "big") + 1) / (2**64 + 1)
+    return -math.log(value) / max(candidate.weight, 1)
+
+
+def _canonical_allowlist(
+    snapshot: ConfigurationSnapshot | None,
+    allowlist: tuple[str, ...] | None,
+) -> set[str] | None:
+    if allowlist is None:
+        return None
+    if snapshot is None:
+        return set(allowlist)
+    return {
+        resolved
+        for value in allowlist
+        if (resolved := snapshot.resolve_model_id(value)) is not None
+    }
 
 
 def _token_cost(candidate: ProviderModel) -> Decimal:

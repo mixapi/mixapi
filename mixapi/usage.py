@@ -28,6 +28,7 @@ class UsageEvent:
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     sequence_id: int | None = field(default=None, compare=False, repr=False)
     provider_connection_id: str | None = None
+    provider_protocol: str | None = None
     configuration_version: int = 0
 
     def public_dict(self) -> dict[str, Any]:

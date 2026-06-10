@@ -19,6 +19,7 @@ class RouteDecisionRecord:
     attempts: tuple[dict[str, str], ...]
     rejected_candidates: tuple[dict[str, str], ...]
     selected_provider_connection_id: str | None = None
+    selected_provider_protocol: str | None = None
     configuration_version: int = 0
 
     def public_dict(self) -> dict[str, Any]:

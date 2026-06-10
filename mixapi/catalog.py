@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 
 from mixapi.models import LogicalModel, ProviderModel
@@ -154,7 +155,7 @@ def catalog_from_snapshot(snapshot: ConfigurationSnapshot) -> dict[str, LogicalM
         candidates_by_model[candidate.logical_model_id].append(
             ProviderModel(
                 id=candidate.id,
-                provider=_runtime_provider_name(provider.protocol),
+                provider=provider.name,
                 provider_model_id=candidate.upstream_model_id,
                 logical_model_id=candidate.logical_model_id,
                 status=candidate.status,
@@ -172,8 +173,12 @@ def catalog_from_snapshot(snapshot: ConfigurationSnapshot) -> dict[str, LogicalM
                 native_features=candidate.native_features,
                 unsupported_parameters=candidate.unsupported_parameters,
                 provider_connection_id=candidate.provider_connection_id,
+                provider_connection_name=provider.name,
+                protocol=provider.protocol,
                 priority=candidate.priority,
                 weight=candidate.weight,
+                latency_ms=_decimal_metadata(provider.metadata, "latency_ms", "1000"),
+                reliability=_decimal_metadata(provider.metadata, "reliability", "0"),
             )
         )
     return {
@@ -191,27 +196,31 @@ def default_seed_document(*, credential: str) -> dict[str, Any]:
     provider_specs = {
         "openai": {
             "id": "provider_openai",
-            "name": "OpenAI default",
+            "name": "openai",
             "protocol": "openai-compatible",
             "base_url": "https://api.openai.com/v1",
+            "metadata": {"adapter": "deterministic", "latency_ms": "120", "reliability": "0.99"},
         },
         "anthropic": {
             "id": "provider_anthropic",
-            "name": "Anthropic default",
+            "name": "anthropic",
             "protocol": "anthropic",
             "base_url": "https://api.anthropic.com",
+            "metadata": {"adapter": "deterministic", "latency_ms": "150", "reliability": "0.97"},
         },
         "gemini": {
             "id": "provider_gemini",
-            "name": "Gemini default",
+            "name": "gemini",
             "protocol": "gemini",
             "base_url": "https://generativelanguage.googleapis.com",
+            "metadata": {"adapter": "deterministic", "latency_ms": "100", "reliability": "0.98"},
         },
         "ollama": {
             "id": "provider_ollama",
-            "name": "Ollama default",
+            "name": "ollama",
             "protocol": "ollama",
             "base_url": "https://ollama.example",
+            "metadata": {"adapter": "deterministic", "latency_ms": "50", "reliability": "0.90"},
         },
     }
     catalog = default_catalog()
@@ -225,7 +234,7 @@ def default_seed_document(*, credential: str) -> dict[str, Any]:
                 "status": "active",
                 "priority": 100,
                 "weight": 1,
-                "metadata": {},
+                "metadata": spec["metadata"],
             }
             for spec in provider_specs.values()
         ],
@@ -245,7 +254,7 @@ def default_seed_document(*, credential: str) -> dict[str, Any]:
                 "provider_connection_id": provider_specs[candidate.provider]["id"],
                 "upstream_model_id": candidate.provider_model_id,
                 "status": candidate.status,
-                "priority": candidate.priority,
+                "priority": _default_candidate_priority(candidate),
                 "weight": candidate.weight,
                 "context_window_tokens": candidate.context_window_tokens,
                 "max_output_tokens": candidate.max_output_tokens,
@@ -267,5 +276,17 @@ def default_seed_document(*, credential: str) -> dict[str, Any]:
     }
 
 
-def _runtime_provider_name(protocol: str) -> str:
-    return "openai" if protocol == "openai-compatible" else protocol
+def _decimal_metadata(metadata: dict[str, Any], key: str, default: str) -> Decimal:
+    return Decimal(str(metadata.get(key, default)))
+
+
+def _default_candidate_priority(candidate: ProviderModel) -> int:
+    priorities = {
+        "openai": 10,
+        "anthropic": 20,
+        "gemini": 30,
+        "ollama": 40,
+    }
+    if candidate.logical_model_id == "mixapi/embedding-small":
+        return 10 if candidate.provider == "openai" else 20
+    return priorities[candidate.provider]

@@ -18,7 +18,6 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from mixapi.adapters import (
     AdapterResponse,
     AnthropicProviderAdapter,
-    CompositeProviderAdapter,
     DeterministicProviderAdapter,
     GeminiProviderAdapter,
     OllamaProviderAdapter,
@@ -30,6 +29,7 @@ from mixapi.adapters import (
     embedding_text,
     extract_text,
 )
+from mixapi.adapter_factory import AdapterFactory
 from mixapi.admin.providers import create_provider_router
 from mixapi.admin.models import create_model_router
 from mixapi.admin.publication import create_publication_router
@@ -169,34 +169,30 @@ def create_app(
     configured_ollama_api_key = ollama_api_key or os.getenv("MIXAPI_OLLAMA_API_KEY")
     provider_adapters: dict[str, Any] = {}
     if configured_openai_base_url:
-        provider_adapters["openai"] = OpenAICompatibleProviderAdapter(
+        provider_adapters["provider_openai"] = OpenAICompatibleProviderAdapter(
             base_url=configured_openai_base_url,
             api_key=configured_openai_api_key,
             timeout_seconds=provider_timeout_seconds,
         )
     if configured_anthropic_base_url:
-        provider_adapters["anthropic"] = AnthropicProviderAdapter(
+        provider_adapters["provider_anthropic"] = AnthropicProviderAdapter(
             base_url=configured_anthropic_base_url,
             api_key=configured_anthropic_api_key,
             api_version=configured_anthropic_version,
             timeout_seconds=provider_timeout_seconds,
         )
     if configured_gemini_base_url:
-        provider_adapters["gemini"] = GeminiProviderAdapter(
+        provider_adapters["provider_gemini"] = GeminiProviderAdapter(
             base_url=configured_gemini_base_url,
             api_key=configured_gemini_api_key,
             timeout_seconds=provider_timeout_seconds,
         )
     if configured_ollama_base_url:
-        provider_adapters["ollama"] = OllamaProviderAdapter(
+        provider_adapters["provider_ollama"] = OllamaProviderAdapter(
             base_url=configured_ollama_base_url,
             api_key=configured_ollama_api_key,
             timeout_seconds=provider_timeout_seconds,
         )
-    adapter = CompositeProviderAdapter(
-        default_adapter=deterministic_adapter,
-        provider_adapters=provider_adapters,
-    )
     configured_token_quota_limit = token_quota_limit
     if configured_token_quota_limit is None:
         raw_token_quota_limit = os.getenv("MIXAPI_TOKEN_QUOTA_LIMIT")
@@ -251,6 +247,13 @@ def create_app(
         active_version=configured_settings.master_key_version,
         previous_keys=configured_settings.previous_master_keys,
     )
+    adapter_factory = AdapterFactory(
+        credential_cipher,
+        deterministic_adapter=deterministic_adapter,
+        connection_overrides=provider_adapters,
+        anthropic_version=configured_anthropic_version,
+        retained_versions=configured_settings.snapshot_retention_count,
+    )
     configuration_repository = PostgresConfigurationRepository(
         postgres_pool,
         credential_cipher,
@@ -283,6 +286,10 @@ def create_app(
 
     def active_catalog() -> dict[str, Any]:
         return catalog_from_snapshot(readiness.require_snapshot())
+
+    def request_routing_resources():
+        snapshot = readiness.require_snapshot()
+        return snapshot, adapter_factory.for_snapshot(snapshot)
 
     managed_workers = ManagedWorkers(
         (
@@ -336,6 +343,7 @@ def create_app(
     app.state.workers = managed_workers
     app.state.readiness = readiness
     app.state.provider_tester = connection_tester
+    app.state.adapter_factory = adapter_factory
     app.include_router(
         create_provider_router(
             configuration_repository,
@@ -410,18 +418,19 @@ def create_app(
         principal: Principal = Depends(authenticate_service),
     ) -> Any:
         require_scope(principal, "responses:create")
-        catalog = active_catalog()
+        snapshot, adapters = request_routing_resources()
         idempotency_key = request.headers.get("idempotency-key")
         validate_response_request(request_body, idempotency_key=idempotency_key)
         if replay := idempotency_store.replay(principal, "responses", idempotency_key, request_body):
             return replay.response
 
         decision = plan_route(
-            catalog,
+            snapshot,
             request_body,
             endpoint="responses",
             model_allowlist=principal.model_allowlist,
             default_objective=principal.routing_objective,
+            selection_seed=request.state.request_id,
         )
         circuit_candidates, circuit_rejections = _circuit_eligible_candidates(
             decision.candidates,
@@ -486,7 +495,7 @@ def create_app(
             try:
                 provider_stream, selected_candidate, failed_attempts = (
                     _dispatch_response_stream_with_fallback(
-                        adapter=adapter,
+                        adapter=adapters,
                         request_body=request_body,
                         candidates=candidates,
                         circuits=circuits,
@@ -557,7 +566,7 @@ def create_app(
             )
         try:
             outcome = _dispatch_response_with_fallback(
-                adapter=adapter,
+                adapter=adapters,
                 request_body=request_body,
                 candidates=candidates,
                 circuits=circuits,
@@ -665,6 +674,8 @@ def create_app(
                 status="succeeded",
                 selected_provider=selected_candidate.provider,
                 selected_provider_model=selected_candidate.provider_model_id,
+                selected_provider_connection_id=selected_candidate.provider_connection_id,
+                selected_provider_protocol=selected_candidate.protocol,
                 attempts=tuple(attempts),
                 rejected_candidates=rejected_candidates,
             )
@@ -709,18 +720,19 @@ def create_app(
         principal: Principal = Depends(authenticate_service),
     ) -> dict[str, Any]:
         require_scope(principal, "embeddings:create")
-        catalog = active_catalog()
+        snapshot, adapters = request_routing_resources()
         idempotency_key = request.headers.get("idempotency-key")
         validate_embedding_request(request_body)
         if replay := idempotency_store.replay(principal, "embeddings", idempotency_key, request_body):
             return replay.response
 
         decision = plan_route(
-            catalog,
+            snapshot,
             request_body,
             endpoint="embeddings",
             model_allowlist=principal.model_allowlist,
             default_objective=principal.routing_objective,
+            selection_seed=request.state.request_id,
         )
         circuit_candidates, circuit_rejections = _circuit_eligible_candidates(
             decision.candidates,
@@ -783,7 +795,7 @@ def create_app(
             raise
         try:
             adapter_response, selected_candidate, failed_attempts = _dispatch_embedding_with_fallback(
-                adapter=adapter,
+                adapter=adapters,
                 request_body=request_body,
                 candidates=candidates,
                 circuits=circuits,
@@ -846,6 +858,7 @@ def create_app(
             output_tokens=0,
             cost_usd=cost,
             provider_connection_id=selected_candidate.provider_connection_id,
+            provider_protocol=selected_candidate.protocol,
         )
         _settle_accounting(
             budget,
@@ -870,6 +883,8 @@ def create_app(
                 status="succeeded",
                 selected_provider=selected_candidate.provider,
                 selected_provider_model=selected_candidate.provider_model_id,
+                selected_provider_connection_id=selected_candidate.provider_connection_id,
+                selected_provider_protocol=selected_candidate.protocol,
                 attempts=tuple(attempts),
                 rejected_candidates=rejected_candidates,
             )
@@ -1367,7 +1382,10 @@ def _dispatch_response_with_fallback(
         for dispatch_index in range(dispatch_count):
             started_at = monotonic()
             try:
-                response = adapter.dispatch_response(dispatch_request, candidate)
+                response = _adapter_for(adapter, candidate).dispatch_response(
+                    dispatch_request,
+                    candidate,
+                )
                 _record_provider_attempt(
                     observability,
                     trace_id,
@@ -1473,7 +1491,10 @@ def _dispatch_response_stream_with_fallback(
     for candidate in candidates:
         started_at = monotonic()
         try:
-            stream = adapter.start_response_stream(request_body, candidate)
+            stream = _adapter_for(adapter, candidate).start_response_stream(
+                request_body,
+                candidate,
+            )
             _record_provider_attempt(
                 observability,
                 trace_id,
@@ -1665,6 +1686,8 @@ def _native_response_event_stream(
             status="succeeded",
             selected_provider=selected_candidate.provider,
             selected_provider_model=selected_candidate.provider_model_id,
+            selected_provider_connection_id=selected_candidate.provider_connection_id,
+            selected_provider_protocol=selected_candidate.protocol,
             attempts=tuple(attempts),
             rejected_candidates=tuple(rejected_candidates),
         )
@@ -1776,6 +1799,8 @@ def _finalize_interrupted_stream(
             status="failed",
             selected_provider=selected_candidate.provider,
             selected_provider_model=selected_candidate.provider_model_id,
+            selected_provider_connection_id=selected_candidate.provider_connection_id,
+            selected_provider_protocol=selected_candidate.protocol,
             attempts=tuple(attempts),
             rejected_candidates=tuple(rejected_candidates),
         )
@@ -1804,6 +1829,7 @@ def _response_usage_event(
         output_tokens=output_tokens,
         cost_usd=cost,
         provider_connection_id=selected_candidate.provider_connection_id,
+        provider_protocol=selected_candidate.protocol,
     )
 
 
@@ -1852,6 +1878,7 @@ def _billable_response_usage_events(
                 output_price=dispatch.candidate.pricing.get("output_per_million", "0"),
             ),
             provider_connection_id=dispatch.candidate.provider_connection_id,
+            provider_protocol=dispatch.candidate.protocol,
         )
         for dispatch in dispatches
     ]
@@ -1957,7 +1984,10 @@ def _dispatch_embedding_with_fallback(
     for candidate in candidates:
         started_at = monotonic()
         try:
-            response = adapter.dispatch_embedding(request_body, candidate)
+            response = _adapter_for(adapter, candidate).dispatch_embedding(
+                request_body,
+                candidate,
+            )
             _record_provider_attempt(
                 observability,
                 trace_id,
@@ -2005,6 +2035,11 @@ def _dispatch_embedding_with_fallback(
             )
 
     raise AllCandidatesFailed(failed_attempts)
+
+
+def _adapter_for(adapter: Any, candidate: ProviderModel) -> Any:
+    resolver = getattr(adapter, "for_candidate", None)
+    return resolver(candidate) if resolver is not None else adapter
 
 
 def _record_provider_attempt(

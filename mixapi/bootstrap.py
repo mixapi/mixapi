@@ -26,7 +26,7 @@ from mixapi.secrets import CredentialAAD, CredentialCipher, InvalidCredentialCip
 from mixapi.snapshots import ConfigurationSnapshot
 
 
-EXPECTED_SCHEMA_REVISION = "20260610_0001"
+EXPECTED_SCHEMA_REVISION = "20260610_0002"
 
 
 class BootstrapValidationError(ValueError):

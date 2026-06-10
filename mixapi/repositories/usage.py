@@ -204,10 +204,10 @@ class PostgresUsageLedger:
             """
             INSERT INTO usage_events (
                 request_id, tenant_id, project_id, api_key_id, endpoint,
-                logical_model, provider_connection_id, provider_protocol,
-                provider_model, configuration_version, input_tokens,
-                output_tokens, cost_usd, created_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                logical_model, provider_connection_id, provider_name,
+                provider_protocol, provider_model, configuration_version,
+                input_tokens, output_tokens, cost_usd, created_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING *
             """,
             (
@@ -219,6 +219,7 @@ class PostgresUsageLedger:
                 event.logical_model,
                 event.provider_connection_id or event.provider,
                 event.provider,
+                event.provider_protocol or event.provider,
                 event.provider_model,
                 event.configuration_version,
                 event.input_tokens,
@@ -248,7 +249,7 @@ def _event_from_row(row: dict[str, Any]) -> UsageEvent:
         api_key_id=row["api_key_id"],
         endpoint=row["endpoint"],
         logical_model=row["logical_model"],
-        provider=row["provider_protocol"],
+        provider=row["provider_name"],
         provider_model=row["provider_model"],
         input_tokens=row["input_tokens"],
         output_tokens=row["output_tokens"],
@@ -256,6 +257,7 @@ def _event_from_row(row: dict[str, Any]) -> UsageEvent:
         created_at=row["created_at"],
         sequence_id=row["id"],
         provider_connection_id=row["provider_connection_id"],
+        provider_protocol=row["provider_protocol"],
         configuration_version=row["configuration_version"],
     )
 
