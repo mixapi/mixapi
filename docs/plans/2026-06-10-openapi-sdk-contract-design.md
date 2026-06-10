@@ -1,0 +1,9 @@
+# OpenAPI Contract And SDK Fixtures Design
+
+MixAPI will publish a deterministic OpenAPI 3.1 contract for every currently exposed public and admin endpoint. A dedicated `mixapi.api_contract` module will define Pydantic models for request bodies, JSON responses, normalized errors, and streaming events. These models are contract-only: endpoint handlers will continue accepting dictionaries and using the existing MixAPI validators, preserving normalized error behavior and avoiding FastAPI's default 422 envelope.
+
+The contract builder will start from FastAPI's generated route metadata, replace weak dictionary body and response schemas with explicit component references, add bearer-auth security schemes, stable operation IDs, documented error responses, and the response media types used by streaming and usage exports. `create_app()` will install this builder as its OpenAPI provider. A deterministic generation command will write the resulting document to `openapi/openapi.json`; a test will fail whenever the checked-in artifact diverges from the application contract.
+
+SDK fixtures will be language-neutral JSON files under `sdk-fixtures/`, indexed by a manifest that identifies each fixture's operation, direction, status code, and contract model. The corpus will cover models, response creation, streaming events, embeddings, route decisions, usage, normalized errors, and every admin request/response family. Tests will validate each fixture through the referenced Pydantic model and ensure every JSON request or response schema used by an operation has at least one fixture. Binary/text export bodies are documented in OpenAPI but excluded from JSON fixture coverage.
+
+This approach keeps one executable schema definition, a reviewable published artifact, and reusable conformance examples without adding a schema-validation dependency or changing runtime payload semantics.
