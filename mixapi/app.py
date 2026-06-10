@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 import os
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -45,10 +46,12 @@ from mixapi.errors import (
     error_response,
     provider_rate_limited,
     provider_unavailable,
+    structured_output_error,
     upstream_timeout,
     validation_error,
 )
 from mixapi.idempotency import InMemoryIdempotencyStore
+from mixapi.models import ProviderModel
 from mixapi.observability import InMemoryObservability, Observability, SafeObservability
 from mixapi.persistence import (
     SQLiteBudgetService,
@@ -63,6 +66,12 @@ from mixapi.quota import InMemoryQuotaService, QuotaService, TokenReservation
 from mixapi.route_decisions import InMemoryRouteDecisionStore, RouteDecisionRecord
 from mixapi.routing import plan_route
 from mixapi.streaming import encode_sse
+from mixapi.structured_output import (
+    ValidationFailure,
+    corrective_request,
+    response_schema,
+    validate_output,
+)
 from mixapi.usage import (
     InMemoryUsageLedger,
     UsageEvent,
@@ -363,7 +372,7 @@ def create_app(
                 },
             )
         try:
-            adapter_response, selected_candidate, failed_attempts = _dispatch_response_with_fallback(
+            outcome = _dispatch_response_with_fallback(
                 adapter=adapter,
                 request_body=request_body,
                 candidates=candidates,
@@ -395,7 +404,14 @@ def create_app(
                     rejected_candidates=rejected_candidates,
                 )
             )
-            raise _public_error_for_failed_attempts(error.failed_attempts)
+            raise _public_error_for_failed_attempts(
+                error.failed_attempts,
+                error.validation_failures,
+            )
+
+        adapter_response = outcome.response
+        selected_candidate = outcome.selected_candidate
+        failed_attempts = list(outcome.failed_attempts)
 
         _record_fallback_transitions(
             instrumentation,
@@ -850,14 +866,46 @@ def create_app(
 app = create_app()
 
 
+@dataclass(frozen=True)
+class BillableDispatch:
+    candidate: ProviderModel
+    response: AdapterResponse
+
+
+@dataclass(frozen=True)
+class ResponseDispatchOutcome:
+    response: AdapterResponse
+    selected_candidate: ProviderModel
+    failed_attempts: tuple[dict[str, str], ...]
+    billable_dispatches: tuple[BillableDispatch, ...]
+
+
 class AllCandidatesFailed(Exception):
-    def __init__(self, failed_attempts: list[dict[str, str]]) -> None:
+    def __init__(
+        self,
+        failed_attempts: list[dict[str, str]],
+        billable_dispatches: list[BillableDispatch] | None = None,
+        validation_failures: tuple[ValidationFailure, ...] = (),
+    ) -> None:
         super().__init__("all candidates failed")
         self.failed_attempts = failed_attempts
+        self.billable_dispatches = billable_dispatches or []
+        self.validation_failures = validation_failures
 
 
-def _public_error_for_failed_attempts(failed_attempts: list[dict[str, str]]) -> MixAPIError:
+def _public_error_for_failed_attempts(
+    failed_attempts: list[dict[str, str]],
+    validation_failures: tuple[ValidationFailure, ...] = (),
+) -> MixAPIError:
     reasons = {attempt["reason"] for attempt in failed_attempts}
+    if reasons == {"schema_validation_failed"}:
+        details = "; ".join(
+            f"{failure.path}: {failure.message}" for failure in validation_failures
+        )
+        message = "All eligible providers returned output that failed JSON Schema validation."
+        if details:
+            message = f"{message} {details}."
+        return structured_output_error("schema_validation_failed", message)
     if reasons == {"upstream_http_429"}:
         return provider_rate_limited(
             "all_candidates_rate_limited",
@@ -1038,60 +1086,100 @@ def _dispatch_response_with_fallback(
     circuits: CircuitBreaker,
     observability: Observability,
     trace_id: str,
-) -> tuple[AdapterResponse, Any, list[dict[str, str]]]:
+) -> ResponseDispatchOutcome:
     failed_attempts: list[dict[str, str]] = []
+    billable_dispatches: list[BillableDispatch] = []
+    schema = response_schema(request_body)
+    validation_failures: tuple[ValidationFailure, ...] = ()
 
     for candidate in candidates:
-        started_at = monotonic()
-        try:
-            response = adapter.dispatch_response(request_body, candidate)
-            _record_provider_attempt(
-                observability,
-                trace_id,
-                endpoint="responses",
-                provider=candidate.provider,
-                provider_model=candidate.provider_model_id,
-                status="ok",
-                started_at=started_at,
-            )
-            circuits.record_success(candidate.provider, candidate.provider_model_id)
-            _record_circuit_state(
-                observability,
-                circuits,
-                trace_id,
-                candidate.provider,
-                candidate.provider_model_id,
-            )
-            return response, candidate, failed_attempts
-        except ProviderDispatchError as error:
-            _record_provider_attempt(
-                observability,
-                trace_id,
-                endpoint="responses",
-                provider=error.provider,
-                provider_model=error.provider_model_id,
-                status="error",
-                started_at=started_at,
-                error_class=error.reason,
-            )
-            circuits.record_failure(error.provider, error.provider_model_id, error.reason)
-            _record_circuit_state(
-                observability,
-                circuits,
-                trace_id,
-                error.provider,
-                error.provider_model_id,
-            )
+        dispatch_request = request_body
+        dispatch_count = 2 if schema is not None else 1
+        for dispatch_index in range(dispatch_count):
+            started_at = monotonic()
+            try:
+                response = adapter.dispatch_response(dispatch_request, candidate)
+                _record_provider_attempt(
+                    observability,
+                    trace_id,
+                    endpoint="responses",
+                    provider=candidate.provider,
+                    provider_model=candidate.provider_model_id,
+                    status="ok",
+                    started_at=started_at,
+                )
+                circuits.record_success(candidate.provider, candidate.provider_model_id)
+                _record_circuit_state(
+                    observability,
+                    circuits,
+                    trace_id,
+                    candidate.provider,
+                    candidate.provider_model_id,
+                )
+            except ProviderDispatchError as error:
+                _record_provider_attempt(
+                    observability,
+                    trace_id,
+                    endpoint="responses",
+                    provider=error.provider,
+                    provider_model=error.provider_model_id,
+                    status="error",
+                    started_at=started_at,
+                    error_class=error.reason,
+                )
+                circuits.record_failure(error.provider, error.provider_model_id, error.reason)
+                _record_circuit_state(
+                    observability,
+                    circuits,
+                    trace_id,
+                    error.provider,
+                    error.provider_model_id,
+                )
+                failed_attempts.append(
+                    {
+                        "provider": error.provider,
+                        "provider_model": error.provider_model_id,
+                        "status": "failed",
+                        "reason": error.reason,
+                    }
+                )
+                break
+
+            billable_dispatches.append(BillableDispatch(candidate, response))
+            if schema is None:
+                return ResponseDispatchOutcome(
+                    response,
+                    candidate,
+                    tuple(failed_attempts),
+                    tuple(billable_dispatches),
+                )
+
+            validation = validate_output(response.output_text, schema)
+            if validation.valid:
+                return ResponseDispatchOutcome(
+                    response,
+                    candidate,
+                    tuple(failed_attempts),
+                    tuple(billable_dispatches),
+                )
+
+            validation_failures = validation.failures
             failed_attempts.append(
                 {
-                    "provider": error.provider,
-                    "provider_model": error.provider_model_id,
+                    "provider": candidate.provider,
+                    "provider_model": candidate.provider_model_id,
                     "status": "failed",
-                    "reason": error.reason,
+                    "reason": "schema_validation_failed",
                 }
             )
+            if dispatch_index == 0:
+                dispatch_request = corrective_request(request_body, validation.failures)
 
-    raise AllCandidatesFailed(failed_attempts)
+    raise AllCandidatesFailed(
+        failed_attempts,
+        billable_dispatches,
+        validation_failures,
+    )
 
 
 def _dispatch_response_stream_with_fallback(
