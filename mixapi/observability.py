@@ -110,6 +110,52 @@ class SafeObservability:
             pass
 
 
+@dataclass(frozen=True)
+class VersionedObservability:
+    delegate: Observability
+    configuration_version: int
+
+    def increment_counter(
+        self,
+        name: str,
+        labels: Mapping[str, object],
+        amount: float = 1,
+    ) -> None:
+        self.delegate.increment_counter(name, labels, amount)
+
+    def observe_histogram(
+        self,
+        name: str,
+        value: float,
+        labels: Mapping[str, object],
+    ) -> None:
+        self.delegate.observe_histogram(name, value, labels)
+
+    def set_gauge(
+        self,
+        name: str,
+        value: float,
+        labels: Mapping[str, object],
+    ) -> None:
+        self.delegate.set_gauge(name, value, labels)
+
+    def record_span(
+        self,
+        name: str,
+        trace_id: str,
+        status: str,
+        duration_ms: float,
+        attributes: Mapping[str, AttributeValue],
+    ) -> None:
+        self.delegate.record_span(
+            name,
+            trace_id,
+            status,
+            duration_ms,
+            {**attributes, "configuration_version": self.configuration_version},
+        )
+
+
 @dataclass
 class InMemoryObservability:
     max_records: int = 10_000

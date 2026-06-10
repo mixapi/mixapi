@@ -6,13 +6,35 @@ from fastapi.testclient import TestClient
 
 from mixapi.adapters import AdapterResponse, DeterministicProviderAdapter
 from mixapi.app import create_app
-from mixapi.observability import InMemoryObservability
+from mixapi.observability import InMemoryObservability, VersionedObservability
 
 
 AUTH_HEADERS = {"Authorization": "Bearer dev-key"}
 
 
 class ObservabilityCollectorTest(unittest.TestCase):
+    def test_versioned_observability_stamps_spans_but_not_metric_labels(self) -> None:
+        collector = InMemoryObservability()
+        observability = VersionedObservability(collector, configuration_version=17)
+
+        observability.increment_counter("requests", {"endpoint": "responses"})
+        observability.record_span(
+            "request",
+            trace_id="trace_versioned",
+            status="ok",
+            duration_ms=1,
+            attributes={"endpoint": "responses"},
+        )
+
+        self.assertEqual(
+            dict(collector.counter_samples()[0].labels),
+            {"endpoint": "responses"},
+        )
+        self.assertEqual(
+            dict(collector.spans()[0].attributes),
+            {"configuration_version": 17, "endpoint": "responses"},
+        )
+
     def test_metric_snapshots_are_deterministic(self) -> None:
         observability = InMemoryObservability()
 
@@ -399,6 +421,7 @@ class ObservabilityEndpointTest(unittest.TestCase):
         self.assertEqual(
             dict(spans[0].attributes),
             {
+                "configuration_version": app.state.snapshot_store.active_version(),
                 "endpoint": "responses",
                 "error_class": "schema_validation_failed",
                 "provider": "openai",

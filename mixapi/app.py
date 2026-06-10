@@ -74,6 +74,7 @@ from mixapi.repositories.route_decisions import PostgresRouteDecisionStore
 from mixapi.repositories.usage import PostgresUsageLedger
 from mixapi.runtime.budget import RedisBudgetService
 from mixapi.runtime.circuits import RedisCircuitBreaker
+from mixapi.runtime.context import RequestRuntimeContext
 from mixapi.runtime.idempotency import RedisIdempotencyStore
 from mixapi.runtime.quota import RedisQuotaService
 from mixapi.runtime.snapshots import RedisSnapshotStore
@@ -287,10 +288,6 @@ def create_app(
     def active_catalog() -> dict[str, Any]:
         return catalog_from_snapshot(readiness.require_snapshot())
 
-    def request_routing_resources():
-        snapshot = readiness.require_snapshot()
-        return snapshot, adapter_factory.for_snapshot(snapshot)
-
     managed_workers = ManagedWorkers(
         (
             WorkerJob(
@@ -362,17 +359,21 @@ def create_app(
     )
 
     @app.middleware("http")
-    async def require_application_readiness(request: Request, call_next):
-        if request.url.path.startswith("/v1/"):
-            status = readiness.check()
-            if not status.ready:
-                return error_response(request, configuration_unavailable())
-        return await call_next(request)
-
-    @app.middleware("http")
     async def attach_request_context(request: Request, call_next):
         request.state.request_id = request.headers.get("x-request-id", f"req_{uuid.uuid4().hex}")
         request.state.trace_id = request.headers.get("traceparent", f"trace_{uuid.uuid4().hex}")
+        if request.url.path.startswith("/v1/"):
+            try:
+                snapshot = readiness.require_snapshot()
+            except MixAPIError:
+                return error_response(request, configuration_unavailable())
+            request.state.runtime_context = RequestRuntimeContext.create(
+                request_id=request.state.request_id,
+                trace_id=request.state.trace_id,
+                snapshot=snapshot,
+                adapter_factory=adapter_factory,
+                observability=instrumentation,
+            )
         return await call_next(request)
 
     @app.exception_handler(MixAPIError)
@@ -397,10 +398,11 @@ def create_app(
 
     @app.get("/v1/models")
     def list_models(
+        request: Request,
         principal: Principal = Depends(authenticate_service),
     ) -> dict[str, object]:
         require_scope(principal, "models:read")
-        catalog = active_catalog()
+        catalog = _request_runtime_context(request).catalog
         return {
             "object": "list",
             "data": [
@@ -418,7 +420,11 @@ def create_app(
         principal: Principal = Depends(authenticate_service),
     ) -> Any:
         require_scope(principal, "responses:create")
-        snapshot, adapters = request_routing_resources()
+        runtime = _request_runtime_context(request)
+        snapshot = runtime.snapshot
+        adapters = runtime.adapters
+        request_observability = runtime.observability
+        configuration_version = runtime.configuration_version
         idempotency_key = request.headers.get("idempotency-key")
         validate_response_request(request_body, idempotency_key=idempotency_key)
         if replay := idempotency_store.replay(principal, "responses", idempotency_key, request_body):
@@ -435,7 +441,7 @@ def create_app(
         circuit_candidates, circuit_rejections = _circuit_eligible_candidates(
             decision.candidates,
             circuits,
-            instrumentation,
+            request_observability,
             request.state.trace_id,
         )
         if not circuit_candidates:
@@ -451,6 +457,7 @@ def create_app(
                     selected_provider_model=None,
                     attempts=(),
                     rejected_candidates=(*decision.rejected, *circuit_rejections),
+                    configuration_version=configuration_version,
                 )
             )
             raise provider_unavailable(
@@ -463,7 +470,7 @@ def create_app(
             endpoint="responses",
             budget=budget,
             principal=principal,
-            observability=instrumentation,
+            observability=request_observability,
             trace_id=request.state.trace_id,
         )
         rejected_candidates = (*decision.rejected, *circuit_rejections, *budget_rejections)
@@ -485,6 +492,7 @@ def create_app(
                     logical_model=request_body["model"],
                     reservation=reservation,
                     token_reservation=token_reservation,
+                    configuration_version=configuration_version,
                 )
             )
         except Exception:
@@ -499,13 +507,13 @@ def create_app(
                         request_body=request_body,
                         candidates=candidates,
                         circuits=circuits,
-                        observability=instrumentation,
+                        observability=request_observability,
                         trace_id=request.state.trace_id,
                     )
                 )
             except AllCandidatesFailed as error:
                 _record_fallback_transitions(
-                    instrumentation,
+                    request_observability,
                     request.state.trace_id,
                     principal,
                     request_body["model"],
@@ -526,12 +534,13 @@ def create_app(
                         selected_provider_model=None,
                         attempts=tuple(error.failed_attempts),
                         rejected_candidates=rejected_candidates,
+                        configuration_version=configuration_version,
                     )
                 )
                 raise _public_error_for_failed_attempts(error.failed_attempts)
 
             _record_fallback_transitions(
-                instrumentation,
+                request_observability,
                 request.state.trace_id,
                 principal,
                 request_body["model"],
@@ -555,7 +564,8 @@ def create_app(
                     circuits=circuits,
                     usage_ledger=usage_ledger,
                     route_decision_store=route_decision_store,
-                    observability=instrumentation,
+                    observability=request_observability,
+                    configuration_version=configuration_version,
                     trace_id=request.state.trace_id,
                 ),
                 media_type="text/event-stream",
@@ -570,12 +580,12 @@ def create_app(
                 request_body=request_body,
                 candidates=candidates,
                 circuits=circuits,
-                observability=instrumentation,
+                observability=request_observability,
                 trace_id=request.state.trace_id,
             )
         except AllCandidatesFailed as error:
             _record_fallback_transitions(
-                instrumentation,
+                request_observability,
                 request.state.trace_id,
                 principal,
                 request_body["model"],
@@ -590,6 +600,7 @@ def create_app(
                     request_id=request.state.request_id,
                     principal=principal,
                     logical_model=request_body["model"],
+                    configuration_version=configuration_version,
                 )
                 _settle_accounting(
                     budget,
@@ -618,6 +629,7 @@ def create_app(
                     selected_provider_model=None,
                     attempts=tuple(error.failed_attempts),
                     rejected_candidates=rejected_candidates,
+                    configuration_version=configuration_version,
                 )
             )
             raise _public_error_for_failed_attempts(
@@ -630,7 +642,7 @@ def create_app(
         failed_attempts = list(outcome.failed_attempts)
 
         _record_fallback_transitions(
-            instrumentation,
+            request_observability,
             request.state.trace_id,
             principal,
             request_body["model"],
@@ -647,6 +659,7 @@ def create_app(
             request_id=request.state.request_id,
             principal=principal,
             logical_model=request_body["model"],
+            configuration_version=configuration_version,
         )
         _settle_accounting(
             budget,
@@ -678,6 +691,7 @@ def create_app(
                 selected_provider_protocol=selected_candidate.protocol,
                 attempts=tuple(attempts),
                 rejected_candidates=rejected_candidates,
+                configuration_version=configuration_version,
             )
         )
 
@@ -720,7 +734,11 @@ def create_app(
         principal: Principal = Depends(authenticate_service),
     ) -> dict[str, Any]:
         require_scope(principal, "embeddings:create")
-        snapshot, adapters = request_routing_resources()
+        runtime = _request_runtime_context(request)
+        snapshot = runtime.snapshot
+        adapters = runtime.adapters
+        request_observability = runtime.observability
+        configuration_version = runtime.configuration_version
         idempotency_key = request.headers.get("idempotency-key")
         validate_embedding_request(request_body)
         if replay := idempotency_store.replay(principal, "embeddings", idempotency_key, request_body):
@@ -737,7 +755,7 @@ def create_app(
         circuit_candidates, circuit_rejections = _circuit_eligible_candidates(
             decision.candidates,
             circuits,
-            instrumentation,
+            request_observability,
             request.state.trace_id,
         )
         if not circuit_candidates:
@@ -753,6 +771,7 @@ def create_app(
                     selected_provider_model=None,
                     attempts=(),
                     rejected_candidates=(*decision.rejected, *circuit_rejections),
+                    configuration_version=configuration_version,
                 )
             )
             raise provider_unavailable(
@@ -765,7 +784,7 @@ def create_app(
             endpoint="embeddings",
             budget=budget,
             principal=principal,
-            observability=instrumentation,
+            observability=request_observability,
             trace_id=request.state.trace_id,
         )
         rejected_candidates = (*decision.rejected, *circuit_rejections, *budget_rejections)
@@ -787,6 +806,7 @@ def create_app(
                     logical_model=request_body["model"],
                     reservation=reservation,
                     token_reservation=token_reservation,
+                    configuration_version=configuration_version,
                 )
             )
         except Exception:
@@ -799,12 +819,12 @@ def create_app(
                 request_body=request_body,
                 candidates=candidates,
                 circuits=circuits,
-                observability=instrumentation,
+                observability=request_observability,
                 trace_id=request.state.trace_id,
             )
         except AllCandidatesFailed as error:
             _record_fallback_transitions(
-                instrumentation,
+                request_observability,
                 request.state.trace_id,
                 principal,
                 request_body["model"],
@@ -825,12 +845,13 @@ def create_app(
                     selected_provider_model=None,
                     attempts=tuple(error.failed_attempts),
                     rejected_candidates=rejected_candidates,
+                    configuration_version=configuration_version,
                 )
             )
             raise _public_error_for_failed_attempts(error.failed_attempts)
 
         _record_fallback_transitions(
-            instrumentation,
+            request_observability,
             request.state.trace_id,
             principal,
             request_body["model"],
@@ -852,6 +873,7 @@ def create_app(
             api_key_id=principal.api_key_id,
             endpoint="embeddings",
             logical_model=request_body["model"],
+            configuration_version=configuration_version,
             provider=selected_candidate.provider,
             provider_model=selected_candidate.provider_model_id,
             input_tokens=adapter_response.input_tokens,
@@ -887,6 +909,7 @@ def create_app(
                 selected_provider_protocol=selected_candidate.protocol,
                 attempts=tuple(attempts),
                 rejected_candidates=rejected_candidates,
+                configuration_version=configuration_version,
             )
         )
 
@@ -1103,6 +1126,15 @@ def create_app(
 
     install_openapi_contract(app)
     return app
+
+
+def _request_runtime_context(request: Request) -> RequestRuntimeContext:
+    context = getattr(request.state, "runtime_context", None)
+    if not isinstance(context, RequestRuntimeContext):
+        raise configuration_unavailable()
+    return context
+
+
 @dataclass(frozen=True)
 class BillableDispatch:
     candidate: ProviderModel
@@ -1552,6 +1584,7 @@ def _native_response_event_stream(
     usage_ledger: Any,
     route_decision_store: Any,
     observability: Observability,
+    configuration_version: int,
     trace_id: str,
 ):
     response_id = f"resp_{uuid.uuid4().hex}"
@@ -1596,6 +1629,7 @@ def _native_response_event_stream(
             usage_ledger=usage_ledger,
             route_decision_store=route_decision_store,
             observability=observability,
+            configuration_version=configuration_version,
             trace_id=trace_id,
             output_text="".join(output_chunks),
             reason="client_disconnected",
@@ -1617,6 +1651,7 @@ def _native_response_event_stream(
             usage_ledger=usage_ledger,
             route_decision_store=route_decision_store,
             observability=observability,
+            configuration_version=configuration_version,
             trace_id=trace_id,
             output_text="".join(output_chunks),
             reason=error.reason,
@@ -1654,6 +1689,7 @@ def _native_response_event_stream(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cost=cost,
+        configuration_version=configuration_version,
     )
     _settle_accounting(
         budget,
@@ -1690,6 +1726,7 @@ def _native_response_event_stream(
             selected_provider_protocol=selected_candidate.protocol,
             attempts=tuple(attempts),
             rejected_candidates=tuple(rejected_candidates),
+            configuration_version=configuration_version,
         )
     )
     response_payload = _response_payload(
@@ -1722,6 +1759,7 @@ def _finalize_interrupted_stream(
     usage_ledger: Any,
     route_decision_store: Any,
     observability: Observability,
+    configuration_version: int,
     trace_id: str,
     output_text: str,
     reason: str,
@@ -1742,6 +1780,7 @@ def _finalize_interrupted_stream(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cost=cost,
+        configuration_version=configuration_version,
     )
     _settle_accounting(
         budget,
@@ -1803,6 +1842,7 @@ def _finalize_interrupted_stream(
             selected_provider_protocol=selected_candidate.protocol,
             attempts=tuple(attempts),
             rejected_candidates=tuple(rejected_candidates),
+            configuration_version=configuration_version,
         )
     )
 
@@ -1815,6 +1855,7 @@ def _response_usage_event(
     input_tokens: int,
     output_tokens: int,
     cost: Decimal,
+    configuration_version: int,
 ) -> UsageEvent:
     return UsageEvent(
         request_id=request_id,
@@ -1830,6 +1871,7 @@ def _response_usage_event(
         cost_usd=cost,
         provider_connection_id=selected_candidate.provider_connection_id,
         provider_protocol=selected_candidate.protocol,
+        configuration_version=configuration_version,
     )
 
 
@@ -1858,6 +1900,7 @@ def _billable_response_usage_events(
     request_id: str,
     principal: Principal,
     logical_model: str,
+    configuration_version: int,
 ) -> list[UsageEvent]:
     return [
         UsageEvent(
@@ -1879,6 +1922,7 @@ def _billable_response_usage_events(
             ),
             provider_connection_id=dispatch.candidate.provider_connection_id,
             provider_protocol=dispatch.candidate.protocol,
+            configuration_version=configuration_version,
         )
         for dispatch in dispatches
     ]
@@ -1907,6 +1951,7 @@ def _usage_write_intent(
     logical_model: str,
     reservation: Any,
     token_reservation: TokenReservation,
+    configuration_version: int,
 ) -> UsageWriteIntent:
     return UsageWriteIntent(
         request_id=request_id,
@@ -1915,7 +1960,7 @@ def _usage_write_intent(
         api_key_id=principal.api_key_id,
         endpoint=endpoint,
         logical_model=logical_model,
-        configuration_version=0,
+        configuration_version=configuration_version,
         reservation_data={
             "budget_reservation_id": reservation.reservation_id,
             "token_reservation_id": token_reservation.reservation_id,

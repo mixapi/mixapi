@@ -127,6 +127,7 @@ class StreamingTest(unittest.TestCase):
             usage_ledger=usage,
             route_decision_store=routes,
             observability=InMemoryObservability(),
+            configuration_version=7,
             trace_id="trace_disconnect",
         )
 
@@ -138,7 +139,9 @@ class StreamingTest(unittest.TestCase):
         self.assertEqual(quota._actual_tokens["key"], 1)
         self.assertEqual(quota._token_reservations, {})
         self.assertEqual(len(usage.events()), 1)
+        self.assertEqual(usage.events()[0].configuration_version, 7)
         self.assertEqual(routes.get_public("req_disconnect", "tenant")["status"], "failed")
+        self.assertEqual(routes._records[("tenant", "req_disconnect")].configuration_version, 7)
 
 
 def parse_sse(raw: str) -> list[dict[str, object]]:
