@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "fixtures": [
+    {"operation_id": "listModels", "direction": "response", "model": "ModelList", "file": "responses/model-list.json"},
+    {"operation_id": "createResponse", "direction": "request", "model": "ResponseCreateRequest", "file": "requests/response-create.json"},
+    {"operation_id": "createResponse", "direction": "response", "model": "ResponseObject", "file": "responses/response-object.json"},
+    {"operation_id": "createResponse", "direction": "event", "model": "ResponseCreatedEvent", "file": "events/response-created.json"},
+    {"operation_id": "createResponse", "direction": "event", "model": "ResponseOutputTextDeltaEvent", "file": "events/response-output-text-delta.json"},
+    {"operation_id": "createResponse", "direction": "event", "model": "ResponseCompletedEvent", "file": "events/response-completed.json"},
+    {"operation_id": "createResponse", "direction": "event", "model": "ResponseErrorEvent", "file": "events/response-error.json"},
+    {"operation_id": "createResponse", "direction": "error", "model": "ErrorEnvelope", "file": "errors/error-envelope.json"},
+    {"operation_id": "createEmbedding", "direction": "request", "model": "EmbeddingCreateRequest", "file": "requests/embedding-create.json"},
+    {"operation_id": "createEmbedding", "direction": "response", "model": "EmbeddingList", "file": "responses/embedding-list.json"},
+    {"operation_id": "getRouteDecision", "direction": "response", "model": "RouteDecision", "file": "responses/route-decision.json"},
+    {"operation_id": "getUsage", "direction": "response", "model": "UsageList", "file": "responses/usage-list.json"},
+    {"operation_id": "createApiKey", "direction": "request", "model": "ApiKeyCreateRequest", "file": "requests/api-key-create.json"},
+    {"operation_id": "createApiKey", "direction": "response", "model": "ApiKeyCreated", "file": "responses/api-key-created.json"},
+    {"operation_id": "listApiKeys", "direction": "response", "model": "ApiKeyList", "file": "responses/api-key-list.json"},
+    {"operation_id": "updateApiKey", "direction": "request", "model": "ApiKeyUpdateRequest", "file": "requests/api-key-update.json"},
+    {"operation_id": "updateApiKey", "direction": "response", "model": "ApiKeyRecord", "file": "responses/api-key-record.json"},
+    {"operation_id": "revokeApiKey", "direction": "response", "model": "ApiKeyRecord", "file": "responses/api-key-record.json"},
+    {"operation_id": "setTenantModelAllowlist", "direction": "request", "model": "TenantModelAllowlistRequest", "file": "requests/tenant-model-allowlist.json"},
+    {"operation_id": "setTenantModelAllowlist", "direction": "response", "model": "TenantPolicy", "file": "responses/tenant-policy.json"},
+    {"operation_id": "setTenantRoutingPolicy", "direction": "request", "model": "TenantRoutingPolicyRequest", "file": "requests/tenant-routing-policy.json"},
+    {"operation_id": "setTenantRoutingPolicy", "direction": "response", "model": "TenantPolicy", "file": "responses/tenant-policy.json"},
+    {"operation_id": "listAuditEvents", "direction": "response", "model": "AuditEventList", "file": "responses/audit-event-list.json"}
+  ]
+}

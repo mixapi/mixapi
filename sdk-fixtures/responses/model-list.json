@@ -1,0 +1,20 @@
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "mixapi/balanced-chat",
+      "object": "model",
+      "status": "active",
+      "description": "Balanced routed chat model",
+      "context_window_tokens": 128000,
+      "input_modalities": ["text", "image"],
+      "output_modalities": ["text"],
+      "tool_modes": ["function"],
+      "schema_support": "strict_json_schema",
+      "streaming": true,
+      "embeddings": false,
+      "providers": ["anthropic", "gemini", "ollama", "openai"],
+      "pricing": {"currency": "usd", "unit": "tokens"}
+    }
+  ]
+}

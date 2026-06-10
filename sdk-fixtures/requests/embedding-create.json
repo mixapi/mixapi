@@ -1,0 +1,5 @@
+{
+  "model": "mixapi/embedding-small",
+  "input": ["first document", "second document"],
+  "routing": {"objective": "lowest-cost"}
+}

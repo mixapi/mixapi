@@ -1,0 +1,27 @@
+{
+  "object": "list",
+  "data": [
+    {
+      "request_id": "req_fixture",
+      "tenant_id": "tenant_acme",
+      "project_id": "project_chat",
+      "api_key_id": "key_fixture",
+      "endpoint": "responses",
+      "logical_model": "mixapi/balanced-chat",
+      "provider": "openai",
+      "provider_model": "gpt-4.1-mini",
+      "input_tokens": 5,
+      "output_tokens": 4,
+      "cost_usd": "0.00001000",
+      "created_at": "2026-06-10T12:00:00Z"
+    }
+  ],
+  "has_more": false,
+  "next_cursor": null,
+  "summary": {
+    "request_count": 1,
+    "input_tokens": 5,
+    "output_tokens": 4,
+    "cost_usd": "0.00001000"
+  }
+}

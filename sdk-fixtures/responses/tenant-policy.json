@@ -1,0 +1,6 @@
+{
+  "tenant_id": "tenant_acme",
+  "model_allowlist": ["mixapi/balanced-chat", "mixapi/embedding-small"],
+  "routing_objective": "highest-reliability",
+  "updated_at": "2026-06-10T12:00:00Z"
+}

@@ -1,0 +1,15 @@
+{
+  "request_id": "req_fixture",
+  "tenant_id": "tenant_acme",
+  "project_id": "project_chat",
+  "endpoint": "responses",
+  "logical_model": "mixapi/balanced-chat",
+  "status": "succeeded",
+  "selected_provider": "openai",
+  "selected_provider_model": "gpt-4.1-mini",
+  "attempts": [
+    {"provider": "openai", "provider_model": "gpt-4.1-mini", "status": "succeeded"}
+  ],
+  "rejected_candidates": [],
+  "fallback_used": false
+}

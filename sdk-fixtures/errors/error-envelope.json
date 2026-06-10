@@ -1,0 +1,9 @@
+{
+  "error": {
+    "type": "validation_error",
+    "code": "input_required",
+    "message": "Request field `input` must contain content.",
+    "request_id": "req_fixture",
+    "trace_id": "trace_fixture"
+  }
+}

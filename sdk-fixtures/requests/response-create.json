@@ -1,0 +1,13 @@
+{
+  "model": "mixapi/balanced-chat",
+  "input": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "input_text", "text": "Summarize the invoice."}
+      ]
+    }
+  ],
+  "max_output_tokens": 128,
+  "routing": {"objective": "highest-reliability", "max_cost_usd": "0.01"}
+}

@@ -1,0 +1,16 @@
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "audit_fixture",
+      "actor_id": "admin",
+      "tenant_id": "tenant_acme",
+      "action": "api_key.created",
+      "target_type": "api_key",
+      "target_id": "key_fixture",
+      "before": null,
+      "after": {"id": "key_fixture", "status": "active"},
+      "created_at": "2026-06-10T12:00:00Z"
+    }
+  ]
+}

@@ -1,0 +1,3 @@
+{
+  "models": ["mixapi/balanced-chat", "mixapi/embedding-small"]
+}

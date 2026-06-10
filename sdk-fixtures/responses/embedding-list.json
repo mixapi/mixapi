@@ -1,0 +1,25 @@
+{
+  "object": "list",
+  "model": "mixapi/embedding-small",
+  "provider": "ollama",
+  "data": [
+    {"object": "embedding", "index": 0, "embedding": [0.1, 0.2, 0.3, 0.4]}
+  ],
+  "usage": {
+    "input_tokens": 2,
+    "output_tokens": 0,
+    "billable_units": [{"type": "embedding_tokens", "quantity": 2}]
+  },
+  "cost": {
+    "provider_cost_usd": "0.00000000",
+    "platform_cost_usd": "0.00000000"
+  },
+  "route": {
+    "attempts": 1,
+    "fallback_used": false,
+    "selected_provider_model": "nomic-embed-text",
+    "failed_attempts": [],
+    "decision_trace_id": "req_embedding_fixture",
+    "rejected_candidates": []
+  }
+}

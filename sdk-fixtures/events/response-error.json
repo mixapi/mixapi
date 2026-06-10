@@ -1,0 +1,7 @@
+{
+  "error": {
+    "type": "stream_interrupted",
+    "code": "provider_stream_interrupted",
+    "message": "The provider stream ended before completion."
+  }
+}

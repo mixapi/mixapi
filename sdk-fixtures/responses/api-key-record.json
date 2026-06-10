@@ -1,0 +1,14 @@
+{
+  "id": "key_fixture",
+  "tenant_id": "tenant_acme",
+  "project_id": "project_chat",
+  "name": "production-chat-renamed",
+  "key_prefix": "mxapi_fixture",
+  "scopes": ["models:read", "responses:create", "usage:read"],
+  "model_allowlist": ["mixapi/balanced-chat"],
+  "budget_limit_usd": "50.00",
+  "expires_at": "2027-01-01T00:00:00Z",
+  "status": "active",
+  "created_at": "2026-06-10T12:00:00Z",
+  "updated_at": "2026-06-10T12:30:00Z"
+}

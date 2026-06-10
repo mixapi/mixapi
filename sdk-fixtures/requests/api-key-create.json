@@ -1,0 +1,9 @@
+{
+  "tenant_id": "tenant_acme",
+  "project_id": "project_chat",
+  "name": "production-chat",
+  "scopes": ["models:read", "responses:create", "usage:read"],
+  "model_allowlist": ["mixapi/balanced-chat"],
+  "budget_limit_usd": "25.00",
+  "expires_at": "2027-01-01T00:00:00Z"
+}

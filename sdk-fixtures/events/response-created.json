@@ -1,0 +1,5 @@
+{
+  "id": "resp_fixture",
+  "model": "mixapi/balanced-chat",
+  "provider": "openai"
+}

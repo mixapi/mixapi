@@ -1,0 +1,37 @@
+{
+  "response": {
+    "id": "resp_fixture",
+    "object": "response",
+    "model": "mixapi/balanced-chat",
+    "provider": "openai",
+    "output": [
+      {
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "Invoice total: $42.00"}]
+      }
+    ],
+    "output_text": "Invoice total: $42.00",
+    "usage": {
+      "input_tokens": 5,
+      "output_tokens": 4,
+      "cached_input_tokens": 0,
+      "billable_units": [
+        {"type": "input_tokens", "quantity": 5},
+        {"type": "output_tokens", "quantity": 4}
+      ]
+    },
+    "cost": {
+      "provider_cost_usd": "0.00001000",
+      "platform_cost_usd": "0.00001000"
+    },
+    "route": {
+      "attempts": 1,
+      "fallback_used": false,
+      "selected_provider_model": "gpt-4.1-mini",
+      "failed_attempts": [],
+      "decision_trace_id": "req_fixture",
+      "rejected_candidates": []
+    }
+  }
+}
