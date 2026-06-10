@@ -1252,6 +1252,7 @@
               }
             ],
             "default": null,
+            "description": "JSON Schema Draft 2020-12 object validated by MixAPI for non-streaming json_schema responses.",
             "title": "Json Schema"
           },
           "type": {
@@ -3331,6 +3332,16 @@
               }
             },
             "description": "Normalized MixAPI error"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Generated output failed JSON Schema validation."
           },
           "429": {
             "content": {

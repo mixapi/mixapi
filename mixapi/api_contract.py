@@ -56,7 +56,13 @@ class FunctionTool(ContractModel):
 
 class ResponseFormat(ContractModel):
     type: Literal["text", "json_object", "json_schema"]
-    json_schema: dict[str, Any] | None = None
+    json_schema: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "JSON Schema Draft 2020-12 object validated by MixAPI for non-streaming "
+            "json_schema responses."
+        ),
+    )
 
 
 class ResponseConfiguration(ContractModel):
@@ -550,6 +556,13 @@ def build_openapi_contract(app: FastAPI) -> dict[str, Any]:
                     },
                 },
             )
+        if path == "/v1/responses" and method == "post":
+            operation["responses"]["422"] = {
+                "description": "Generated output failed JSON Schema validation.",
+                "content": {
+                    "application/json": {"schema": _schema_ref("ErrorEnvelope")}
+                },
+            }
 
     app.openapi_schema = contract
     return contract

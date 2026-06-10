@@ -59,6 +59,20 @@ class SDKFixturesTest(unittest.TestCase):
             self.assertIn(("createResponse", "event", model_name), coverage)
         self.assertIn(("createResponse", "error", "ErrorEnvelope"), coverage)
 
+    def test_response_fixtures_cover_strict_schema_and_validation_failure(self) -> None:
+        request = json.loads(
+            (FIXTURE_ROOT / "requests" / "response-create.json").read_text()
+        )
+        error = json.loads(
+            (FIXTURE_ROOT / "errors" / "error-envelope.json").read_text()
+        )
+
+        response_format = request["response"]["format"]
+        self.assertEqual(response_format["type"], "json_schema")
+        self.assertEqual(response_format["json_schema"]["$schema"], "https://json-schema.org/draft/2020-12/schema")
+        self.assertEqual(error["error"]["type"], "structured_output_error")
+        self.assertEqual(error["error"]["code"], "schema_validation_failed")
+
 
 if __name__ == "__main__":
     unittest.main()

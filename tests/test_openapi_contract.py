@@ -72,6 +72,10 @@ class OpenAPIContractTest(unittest.TestCase):
             response_operation["responses"]["400"]["content"]["application/json"]["schema"],
             {"$ref": "#/components/schemas/ErrorEnvelope"},
         )
+        self.assertEqual(
+            response_operation["responses"]["422"]["content"]["application/json"]["schema"],
+            {"$ref": "#/components/schemas/ErrorEnvelope"},
+        )
 
         embedding_operation = self.contract["paths"]["/v1/embeddings"]["post"]
         self.assertEqual(
@@ -104,6 +108,18 @@ class OpenAPIContractTest(unittest.TestCase):
         ):
             with self.subTest(schema_name=schema_name):
                 self.assertIn(schema_name, schemas)
+
+    def test_response_format_documents_draft_2020_12_validation(self) -> None:
+        schema = self.contract["components"]["schemas"]["ResponseFormat"]
+
+        self.assertIn(
+            "Draft 2020-12",
+            schema["properties"]["json_schema"]["description"],
+        )
+        self.assertIn(
+            "non-streaming",
+            schema["properties"]["json_schema"]["description"],
+        )
 
     def test_streaming_and_export_media_types_are_documented(self) -> None:
         response_operation = self.contract["paths"]["/v1/responses"]["post"]

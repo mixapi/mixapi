@@ -1,8 +1,8 @@
 {
   "error": {
-    "type": "validation_error",
-    "code": "input_required",
-    "message": "Request field `input` must contain content.",
+    "type": "structured_output_error",
+    "code": "schema_validation_failed",
+    "message": "All eligible providers returned output that failed JSON Schema validation. $.summary: required property.",
     "request_id": "req_fixture",
     "trace_id": "trace_fixture"
   }

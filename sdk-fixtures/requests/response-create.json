@@ -9,5 +9,19 @@
     }
   ],
   "max_output_tokens": 128,
+  "response": {
+    "format": {
+      "type": "json_schema",
+      "json_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "summary": {"type": "string"}
+        },
+        "required": ["summary"],
+        "additionalProperties": false
+      }
+    }
+  },
   "routing": {"objective": "highest-reliability", "max_cost_usd": "0.01"}
 }
