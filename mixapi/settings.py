@@ -82,8 +82,8 @@ class Settings:
             raise ConfigurationError("Worker shutdown timeout must be positive")
 
     @classmethod
-    def from_env(cls) -> Settings:
-        database_url = _required_env("MIXAPI_DATABASE_URL")
+    def from_env(cls, *, database_url: str | None = None) -> Settings:
+        database_url = database_url or _required_env("MIXAPI_DATABASE_URL")
         redis_url = _required_env("MIXAPI_REDIS_URL")
         master_key = _decode_key(_required_env("MIXAPI_MASTER_KEY"), "MIXAPI_MASTER_KEY")
         master_key_version = _positive_int(

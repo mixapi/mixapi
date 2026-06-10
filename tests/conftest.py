@@ -47,7 +47,9 @@ def reset_runtime_state(database_url: str, redis_url: str) -> None:
     with psycopg.connect(database_url) as connection:
         connection.execute(
             """
-            TRUNCATE usage_events, route_decisions, budget_spend,
+            TRUNCATE sqlite_migration_batches, sqlite_migration_runs,
+                     api_keys, tenant_policies,
+                     usage_events, route_decisions, budget_spend,
                      usage_write_intents, budget_reconciliation_outbox,
                      configuration_outbox, configuration_versions,
                      model_candidates, logical_model_aliases, logical_models,
