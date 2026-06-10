@@ -20,6 +20,10 @@ This backlog closes the highest-priority gaps between the current implementation
 - [x] Add metrics and traces for provider latency, errors, fallbacks, circuit state, and budget denials.
 - [x] Generate and validate an explicit OpenAPI contract and SDK fixtures.
 
+## P1 Execution Queue
+
+- [x] Add provider-neutral Draft 2020-12 structured-output validation with corrective retry, fallback, aggregate accounting, observability, and contract coverage.
+
 ## Completion Rule
 
 A task is complete only when its focused tests pass, the full suite remains green, and its checkbox is updated in this file.
