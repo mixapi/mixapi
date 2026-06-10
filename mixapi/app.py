@@ -5,6 +5,7 @@ import os
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
 from fastapi import Body, Depends, Request
@@ -47,6 +48,7 @@ from mixapi.errors import (
     validation_error,
 )
 from mixapi.idempotency import InMemoryIdempotencyStore
+from mixapi.observability import InMemoryObservability
 from mixapi.persistence import (
     SQLiteBudgetService,
     SQLiteCircuitBreaker,
@@ -92,6 +94,7 @@ def create_app(
     circuit_recovery_seconds: float | None = None,
     token_quota_limit: int | None = None,
     admin_api_key: str | None = None,
+    observability: InMemoryObservability | None = None,
 ) -> FastAPI:
     app = FastAPI(title="MixAPI", version="0.1.0")
     catalog = default_catalog()
@@ -186,6 +189,7 @@ def create_app(
     route_decision_store = (
         SQLiteRouteDecisionStore(database) if database else InMemoryRouteDecisionStore()
     )
+    observability = observability or InMemoryObservability()
     app.state.usage_ledger = usage_ledger
     app.state.idempotency_store = idempotency_store
     app.state.route_decision_store = route_decision_store
@@ -193,6 +197,7 @@ def create_app(
     app.state.budget = budget
     app.state.circuits = circuits
     app.state.control_plane = control_plane
+    app.state.observability = observability
 
     @app.middleware("http")
     async def attach_request_context(request: Request, call_next):
@@ -289,9 +294,17 @@ def create_app(
                         request_body=request_body,
                         candidates=candidates,
                         circuits=circuits,
+                        observability=observability,
+                        trace_id=request.state.trace_id,
                     )
                 )
             except AllCandidatesFailed as error:
+                _record_fallback_transitions(
+                    observability,
+                    principal,
+                    request_body["model"],
+                    error.failed_attempts,
+                )
                 budget.release(reservation)
                 quota.release_tokens(token_reservation)
                 route_decision_store.record(
@@ -309,6 +322,14 @@ def create_app(
                     )
                 )
                 raise _public_error_for_failed_attempts(error.failed_attempts)
+
+            _record_fallback_transitions(
+                observability,
+                principal,
+                request_body["model"],
+                failed_attempts,
+                selected_candidate,
+            )
 
             return StreamingResponse(
                 _native_response_event_stream(
@@ -339,8 +360,16 @@ def create_app(
                 request_body=request_body,
                 candidates=candidates,
                 circuits=circuits,
+                observability=observability,
+                trace_id=request.state.trace_id,
             )
         except AllCandidatesFailed as error:
+            _record_fallback_transitions(
+                observability,
+                principal,
+                request_body["model"],
+                error.failed_attempts,
+            )
             budget.release(reservation)
             quota.release_tokens(token_reservation)
             route_decision_store.record(
@@ -358,6 +387,14 @@ def create_app(
                 )
             )
             raise _public_error_for_failed_attempts(error.failed_attempts)
+
+        _record_fallback_transitions(
+            observability,
+            principal,
+            request_body["model"],
+            failed_attempts,
+            selected_candidate,
+        )
 
         response_id = f"resp_{uuid.uuid4().hex}"
         cost = _estimate_cost(
@@ -506,8 +543,16 @@ def create_app(
                 request_body=request_body,
                 candidates=candidates,
                 circuits=circuits,
+                observability=observability,
+                trace_id=request.state.trace_id,
             )
         except AllCandidatesFailed as error:
+            _record_fallback_transitions(
+                observability,
+                principal,
+                request_body["model"],
+                error.failed_attempts,
+            )
             budget.release(reservation)
             quota.release_tokens(token_reservation)
             route_decision_store.record(
@@ -525,6 +570,14 @@ def create_app(
                 )
             )
             raise _public_error_for_failed_attempts(error.failed_attempts)
+
+        _record_fallback_transitions(
+            observability,
+            principal,
+            request_body["model"],
+            failed_attempts,
+            selected_candidate,
+        )
 
         embedding = adapter_response.embedding or []
         cost = _estimate_cost(
@@ -908,15 +961,37 @@ def _dispatch_response_with_fallback(
     request_body: dict[str, Any],
     candidates,
     circuits: CircuitBreaker,
+    observability: InMemoryObservability,
+    trace_id: str,
 ) -> tuple[AdapterResponse, Any, list[dict[str, str]]]:
     failed_attempts: list[dict[str, str]] = []
 
     for candidate in candidates:
+        started_at = monotonic()
         try:
             response = adapter.dispatch_response(request_body, candidate)
+            _record_provider_attempt(
+                observability,
+                trace_id,
+                endpoint="responses",
+                provider=candidate.provider,
+                provider_model=candidate.provider_model_id,
+                status="ok",
+                started_at=started_at,
+            )
             circuits.record_success(candidate.provider, candidate.provider_model_id)
             return response, candidate, failed_attempts
         except ProviderDispatchError as error:
+            _record_provider_attempt(
+                observability,
+                trace_id,
+                endpoint="responses",
+                provider=error.provider,
+                provider_model=error.provider_model_id,
+                status="error",
+                started_at=started_at,
+                error_class=error.reason,
+            )
             circuits.record_failure(error.provider, error.provider_model_id, error.reason)
             failed_attempts.append(
                 {
@@ -935,14 +1010,36 @@ def _dispatch_response_stream_with_fallback(
     request_body: dict[str, Any],
     candidates,
     circuits: CircuitBreaker,
+    observability: InMemoryObservability,
+    trace_id: str,
 ) -> tuple[ProviderStream, Any, list[dict[str, str]]]:
     failed_attempts: list[dict[str, str]] = []
 
     for candidate in candidates:
+        started_at = monotonic()
         try:
             stream = adapter.start_response_stream(request_body, candidate)
+            _record_provider_attempt(
+                observability,
+                trace_id,
+                endpoint="responses",
+                provider=candidate.provider,
+                provider_model=candidate.provider_model_id,
+                status="ok",
+                started_at=started_at,
+            )
             return stream, candidate, failed_attempts
         except ProviderDispatchError as error:
+            _record_provider_attempt(
+                observability,
+                trace_id,
+                endpoint="responses",
+                provider=error.provider,
+                provider_model=error.provider_model_id,
+                status="error",
+                started_at=started_at,
+                error_class=error.reason,
+            )
             circuits.record_failure(error.provider, error.provider_model_id, error.reason)
             failed_attempts.append(
                 {
@@ -1253,15 +1350,37 @@ def _dispatch_embedding_with_fallback(
     request_body: dict[str, Any],
     candidates,
     circuits: CircuitBreaker,
+    observability: InMemoryObservability,
+    trace_id: str,
 ) -> tuple[AdapterResponse, Any, list[dict[str, str]]]:
     failed_attempts: list[dict[str, str]] = []
 
     for candidate in candidates:
+        started_at = monotonic()
         try:
             response = adapter.dispatch_embedding(request_body, candidate)
+            _record_provider_attempt(
+                observability,
+                trace_id,
+                endpoint="embeddings",
+                provider=candidate.provider,
+                provider_model=candidate.provider_model_id,
+                status="ok",
+                started_at=started_at,
+            )
             circuits.record_success(candidate.provider, candidate.provider_model_id)
             return response, candidate, failed_attempts
         except ProviderDispatchError as error:
+            _record_provider_attempt(
+                observability,
+                trace_id,
+                endpoint="embeddings",
+                provider=error.provider,
+                provider_model=error.provider_model_id,
+                status="error",
+                started_at=started_at,
+                error_class=error.reason,
+            )
             circuits.record_failure(error.provider, error.provider_model_id, error.reason)
             failed_attempts.append(
                 {
@@ -1273,6 +1392,58 @@ def _dispatch_embedding_with_fallback(
             )
 
     raise AllCandidatesFailed(failed_attempts)
+
+
+def _record_provider_attempt(
+    observability: InMemoryObservability,
+    trace_id: str,
+    endpoint: str,
+    provider: str,
+    provider_model: str,
+    status: str,
+    started_at: float,
+    error_class: str | None = None,
+) -> None:
+    duration_ms = max((monotonic() - started_at) * 1000, 0)
+    labels = {"provider": provider, "provider_model": provider_model}
+    observability.observe_histogram("mixapi_provider_latency_ms", duration_ms, labels)
+    attributes = {"endpoint": endpoint, **labels}
+    if error_class is not None:
+        attributes["error_class"] = error_class
+        observability.increment_counter(
+            "mixapi_provider_errors_total",
+            {"provider": provider, "error_class": error_class},
+        )
+    observability.record_span(
+        "provider.dispatch",
+        trace_id=trace_id,
+        status=status,
+        duration_ms=duration_ms,
+        attributes=attributes,
+    )
+
+
+def _record_fallback_transitions(
+    observability: InMemoryObservability,
+    principal: Principal,
+    logical_model: str,
+    failed_attempts: list[dict[str, str]],
+    selected_candidate: Any | None = None,
+) -> None:
+    destinations = [attempt["provider"] for attempt in failed_attempts[1:]]
+    if selected_candidate is not None:
+        destinations.append(selected_candidate.provider)
+    for failed_attempt, destination in zip(failed_attempts, destinations, strict=False):
+        observability.increment_counter(
+            "mixapi_fallbacks_total",
+            {
+                "tenant": principal.tenant_id,
+                "model": logical_model,
+                "from_provider": failed_attempt["provider"],
+                "to_provider": destination,
+                "reason": failed_attempt["reason"],
+            },
+        )
 
 
 def _route_attempts(
