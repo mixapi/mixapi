@@ -27,6 +27,7 @@ from mixapi.adapters import (
     embedding_text,
     extract_text,
 )
+from mixapi.api_contract import install_openapi_contract
 from mixapi.auth import (
     AdminPrincipal,
     Principal,
@@ -842,6 +843,7 @@ def create_app(
             ],
         }
 
+    install_openapi_contract(app)
     return app
 
 
