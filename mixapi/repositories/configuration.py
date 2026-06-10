@@ -144,6 +144,7 @@ class PostgresConfigurationRepository:
         priority: int | object = _UNSET,
         weight: int | object = _UNSET,
         metadata: dict[str, Any] | object = _UNSET,
+        expected_updated_at: datetime | None = None,
     ) -> ConfigurationMutationResult[ProviderConnection]:
         try:
             with self._pool.connection() as connection:
@@ -154,6 +155,8 @@ class PostgresConfigurationRepository:
                 if current_row is None:
                     raise ConfigurationNotFound(f"provider not found: {provider_id}")
                 current = _provider_from_row(current_row)
+                if expected_updated_at is not None and current.updated_at != expected_updated_at:
+                    raise ConfigurationConflict("provider was modified by another request")
                 next_protocol = current.protocol if protocol is _UNSET else str(protocol)
                 next_url = current.base_url if base_url is _UNSET else str(base_url)
                 next_timeout = current.timeout_seconds if timeout_seconds is _UNSET else Decimal(timeout_seconds)
@@ -220,6 +223,7 @@ class PostgresConfigurationRepository:
         credential: str,
         *,
         actor_id: str,
+        expected_updated_at: datetime | None = None,
     ) -> ConfigurationMutationResult[ProviderConnection]:
         with self._pool.connection() as connection:
             current_row = connection.execute(
@@ -229,6 +233,8 @@ class PostgresConfigurationRepository:
             if current_row is None:
                 raise ConfigurationNotFound(f"provider not found: {provider_id}")
             current = _provider_from_row(current_row)
+            if expected_updated_at is not None and current.updated_at != expected_updated_at:
+                raise ConfigurationConflict("provider was modified by another request")
             envelope = self._cipher.encrypt(
                 credential,
                 CredentialAAD(provider_id=provider_id, protocol=current.protocol, field="api_key"),

@@ -56,6 +56,15 @@ def validation_error(code: str, message: str) -> MixAPIError:
     )
 
 
+def conflict(code: str, message: str) -> MixAPIError:
+    return MixAPIError(
+        type="conflict",
+        code=code,
+        message=message,
+        status_code=409,
+    )
+
+
 def capability_unsupported(code: str, message: str) -> MixAPIError:
     return MixAPIError(
         type="capability_unsupported",

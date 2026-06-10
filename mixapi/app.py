@@ -30,6 +30,7 @@ from mixapi.adapters import (
     embedding_text,
     extract_text,
 )
+from mixapi.admin.providers import create_provider_router
 from mixapi.api_contract import install_openapi_contract
 from mixapi.auth import (
     AdminPrincipal,
@@ -57,6 +58,7 @@ from mixapi.errors import (
 from mixapi.models import ProviderModel
 from mixapi.observability import InMemoryObservability, Observability, SafeObservability
 from mixapi.postgres import PostgresPool
+from mixapi.provider_testing import ProviderConnectionTester
 from mixapi.publication import ConfigurationPublisher
 from mixapi.persistence import (
     SQLiteDatabase,
@@ -125,6 +127,7 @@ def create_app(
     admin_api_key: str | None = None,
     observability: Observability | None = None,
     settings: Settings | None = None,
+    provider_tester: ProviderConnectionTester | None = None,
 ) -> FastAPI:
     configured_settings = settings or Settings.from_env()
     postgres_pool = PostgresPool(configured_settings)
@@ -250,6 +253,7 @@ def create_app(
         postgres_pool,
         credential_cipher,
     )
+    connection_tester = provider_tester or ProviderConnectionTester(credential_cipher)
     snapshot_store = RedisSnapshotStore(
         redis_runtime.client,
         namespace=configured_settings.redis_namespace,
@@ -328,6 +332,14 @@ def create_app(
     app.state.configuration_publisher = configuration_publisher
     app.state.workers = managed_workers
     app.state.readiness = readiness
+    app.state.provider_tester = connection_tester
+    app.include_router(
+        create_provider_router(
+            configuration_repository,
+            authenticate_admin,
+            connection_tester,
+        )
+    )
 
     @app.middleware("http")
     async def require_application_readiness(request: Request, call_next):
