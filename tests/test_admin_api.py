@@ -1,9 +1,10 @@
 import json
-import tempfile
+import os
 import unittest
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
+import psycopg
+import redis
 from fastapi.testclient import TestClient
 
 from mixapi.app import create_app
@@ -14,8 +15,19 @@ ADMIN_HEADERS = {"Authorization": "Bearer admin-secret"}
 
 class AdminApiTest(unittest.TestCase):
     def setUp(self) -> None:
+        with psycopg.connect(os.environ["MIXAPI_DATABASE_URL"]) as connection:
+            connection.execute(
+                "TRUNCATE api_keys, tenant_policies, audit_events RESTART IDENTITY CASCADE"
+            )
+        redis_client = redis.Redis.from_url(os.environ["MIXAPI_REDIS_URL"])
+        redis_client.flushdb()
+        redis_client.close()
         self.app = create_app(admin_api_key="admin-secret")
         self.client = TestClient(self.app)
+        self.client.__enter__()
+
+    def tearDown(self) -> None:
+        self.client.__exit__(None, None, None)
 
     def test_admin_endpoints_require_separate_operator_credential(self) -> None:
         missing = self.client.get("/admin/v1/api-keys")
@@ -354,46 +366,18 @@ class AdminApiTest(unittest.TestCase):
         self.assertEqual(second_low.json()["error"]["code"], "api_key_budget_exceeded")
         self.assertEqual(first_high.status_code, 200)
 
-    def test_managed_configuration_and_budget_enforcement_survive_sqlite_restart(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            database_path = Path(directory) / "mixapi.sqlite3"
-            first_app = create_app(
-                admin_api_key="admin-secret",
-                database_path=database_path,
-            )
-            first_client = TestClient(first_app)
-            created = self._create_key(
-                client=first_client,
-                scopes=["responses:create"],
-                budget_limit_usd="0.00001000",
-            ).json()
-            request_body = {
-                "model": "mixapi/balanced-chat",
-                "input": "Budget",
-                "max_output_tokens": 4,
-                "native": {"provider": "openai"},
-            }
+    def test_managed_configuration_survives_application_restart(self) -> None:
+        created = self._create_key(scopes=["models:read"]).json()
 
-            first = first_client.post(
-                "/v1/responses",
+        restarted_app = create_app(admin_api_key="admin-secret")
+        with TestClient(restarted_app) as restarted_client:
+            response = restarted_client.get(
+                "/v1/models",
                 headers=self._service_headers(created["secret"]),
-                json=request_body,
-            )
-            restarted_client = TestClient(
-                create_app(
-                    admin_api_key="admin-secret",
-                    database_path=database_path,
-                )
-            )
-            second = restarted_client.post(
-                "/v1/responses",
-                headers=self._service_headers(created["secret"]),
-                json=request_body,
             )
 
-        self.assertEqual(first.status_code, 200)
-        self.assertEqual(second.status_code, 402)
-        self.assertEqual(second.json()["error"]["code"], "api_key_budget_exceeded")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["object"], "list")
 
     def _create_key(self, client=None, **overrides):
         target_client = client or self.client

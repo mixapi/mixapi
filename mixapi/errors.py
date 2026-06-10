@@ -6,7 +6,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 
 
-@dataclass(frozen=True)
+@dataclass
 class MixAPIError(Exception):
     type: str
     code: str

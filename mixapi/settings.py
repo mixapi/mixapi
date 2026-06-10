@@ -22,6 +22,7 @@ class Settings:
     postgres_pool_max_size: int = 10
     dependency_connect_timeout_seconds: float = 5.0
     redis_socket_timeout_seconds: float = 2.0
+    auth_cache_ttl_seconds: int = 60
 
     def __post_init__(self) -> None:
         if not self.database_url.strip():
@@ -44,6 +45,8 @@ class Settings:
             raise ConfigurationError("Dependency connect timeout must be positive")
         if self.redis_socket_timeout_seconds <= 0:
             raise ConfigurationError("Redis socket timeout must be positive")
+        if self.auth_cache_ttl_seconds <= 0:
+            raise ConfigurationError("Auth cache TTL must be positive")
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -73,6 +76,7 @@ class Settings:
                 "MIXAPI_REDIS_SOCKET_TIMEOUT_SECONDS",
                 2.0,
             ),
+            auth_cache_ttl_seconds=_env_positive_int("MIXAPI_AUTH_CACHE_TTL_SECONDS", 60),
         )
 
 

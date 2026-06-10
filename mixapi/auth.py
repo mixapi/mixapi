@@ -8,6 +8,7 @@ from hmac import compare_digest
 
 from fastapi import Header
 
+from mixapi.auth_cache import RedisAuthCache
 from mixapi.control_plane import ApiKeyRecord, ControlPlaneStore, TenantPolicy
 from mixapi.errors import authentication_failed, permission_denied
 
@@ -73,19 +74,40 @@ def authenticate(authorization: str | None = Header(default=None)) -> Principal:
 
 def build_service_authenticator(
     control_plane: ControlPlaneStore,
+    auth_cache: RedisAuthCache,
 ) -> Callable[..., Principal]:
     def authenticate_service(authorization: str | None = Header(default=None)) -> Principal:
         token = _bearer_token(authorization, "api_key", "API key")
         if principal := configured_api_keys().get(token):
             return principal
 
-        record = control_plane.resolve_api_key(token)
-        if record is None:
+        authentication = auth_cache.resolve(
+            token,
+            lambda: _load_managed_authentication(control_plane, token),
+        )
+        if authentication is None:
             raise authentication_failed("invalid_api_key", "Invalid bearer API key.")
-        policy = control_plane.get_tenant_policy(record.tenant_id)
-        return _managed_principal(record, policy)
+        return Principal(
+            tenant_id=authentication.tenant_id,
+            project_id=authentication.project_id,
+            api_key_id=authentication.api_key_id,
+            scopes=authentication.scopes,
+            model_allowlist=authentication.model_allowlist,
+            budget_limit_usd=authentication.budget_limit_usd,
+            routing_objective=authentication.routing_objective,
+        )
 
     return authenticate_service
+
+
+def _load_managed_authentication(
+    control_plane: ControlPlaneStore,
+    token: str,
+) -> tuple[ApiKeyRecord, TenantPolicy] | None:
+    record = control_plane.resolve_api_key(token)
+    if record is None:
+        return None
+    return record, control_plane.get_tenant_policy(record.tenant_id)
 
 
 def require_scope(principal: Principal, required_scope: str) -> None:
@@ -112,35 +134,6 @@ def build_admin_authenticator(expected_key: str | None) -> Callable[..., AdminPr
         return AdminPrincipal(actor_id="admin")
 
     return authenticate_admin
-
-
-def _managed_principal(record: ApiKeyRecord, policy: TenantPolicy) -> Principal:
-    return Principal(
-        tenant_id=record.tenant_id,
-        project_id=record.project_id,
-        api_key_id=record.id,
-        scopes=record.scopes,
-        model_allowlist=_effective_model_allowlist(
-            record.model_allowlist,
-            policy.model_allowlist,
-        ),
-        budget_limit_usd=record.budget_limit_usd,
-        routing_objective=policy.routing_objective,
-    )
-
-
-def _effective_model_allowlist(
-    key_allowlist: tuple[str, ...],
-    tenant_allowlist: tuple[str, ...],
-) -> tuple[str, ...] | None:
-    if not key_allowlist and not tenant_allowlist:
-        return None
-    if not key_allowlist:
-        return tenant_allowlist
-    if not tenant_allowlist:
-        return key_allowlist
-    tenant_models = set(tenant_allowlist)
-    return tuple(model for model in key_allowlist if model in tenant_models)
 
 
 def _bearer_token(

@@ -14,7 +14,12 @@ ROOT = Path(__file__).resolve().parents[1]
 class OpenAPIContractTest(unittest.TestCase):
     def setUp(self) -> None:
         self.app = create_app(admin_api_key="admin-secret")
+        self.client = TestClient(self.app)
+        self.client.__enter__()
         self.contract = self.app.openapi()
+
+    def tearDown(self) -> None:
+        self.client.__exit__(None, None, None)
 
     def test_contract_has_stable_operations_and_security_schemes(self) -> None:
         self.assertEqual(self.contract["openapi"], "3.1.0")
@@ -186,7 +191,7 @@ class OpenAPIContractTest(unittest.TestCase):
         self.assertEqual((ROOT / "openapi" / "openapi.json").read_text(), expected)
 
     def test_live_json_responses_conform_to_contract_models(self) -> None:
-        client = TestClient(self.app)
+        client = self.client
         service_headers = {
             "Authorization": "Bearer dev-key",
             "X-Request-ID": "req_contract_live",

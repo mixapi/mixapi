@@ -37,10 +37,10 @@ from mixapi.auth import (
     build_service_authenticator,
     require_scope,
 )
+from mixapi.auth_cache import RedisAuthCache
 from mixapi.budget import BudgetService, InMemoryBudgetService
 from mixapi.catalog import default_catalog
 from mixapi.circuits import CircuitBreaker, InMemoryCircuitBreaker
-from mixapi.control_plane import InMemoryControlPlaneStore
 from mixapi.errors import (
     MixAPIError,
     budget_exceeded,
@@ -58,7 +58,6 @@ from mixapi.postgres import PostgresPool
 from mixapi.persistence import (
     SQLiteBudgetService,
     SQLiteCircuitBreaker,
-    SQLiteControlPlaneStore,
     SQLiteDatabase,
     SQLiteIdempotencyStore,
     SQLiteRouteDecisionStore,
@@ -66,6 +65,7 @@ from mixapi.persistence import (
 )
 from mixapi.quota import InMemoryQuotaService, QuotaService, TokenReservation
 from mixapi.redis_runtime import RedisRuntime
+from mixapi.repositories.control_plane import PostgresControlPlaneStore
 from mixapi.route_decisions import InMemoryRouteDecisionStore, RouteDecisionRecord
 from mixapi.routing import plan_route
 from mixapi.streaming import encode_sse
@@ -195,12 +195,14 @@ def create_app(
     )
     configured_database_path = database_path or os.getenv("MIXAPI_DATABASE_PATH")
     database = SQLiteDatabase(configured_database_path) if configured_database_path else None
-    control_plane = (
-        SQLiteControlPlaneStore(database) if database else InMemoryControlPlaneStore()
+    auth_cache = RedisAuthCache(
+        redis_runtime.client,
+        ttl_seconds=configured_settings.auth_cache_ttl_seconds,
     )
+    control_plane = PostgresControlPlaneStore(postgres_pool, auth_cache=auth_cache)
     configured_admin_api_key = admin_api_key or configured_settings.admin_api_key
     authenticate_admin = build_admin_authenticator(configured_admin_api_key)
-    authenticate_service = build_service_authenticator(control_plane)
+    authenticate_service = build_service_authenticator(control_plane, auth_cache)
     budget = (
         SQLiteBudgetService(database, limit_usd=budget_limit)
         if database
@@ -233,6 +235,7 @@ def create_app(
     app.state.budget = budget
     app.state.circuits = circuits
     app.state.control_plane = control_plane
+    app.state.auth_cache = auth_cache
     app.state.observability = observability
     app.state.settings = configured_settings
     app.state.postgres_pool = postgres_pool

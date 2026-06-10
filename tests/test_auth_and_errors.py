@@ -8,6 +8,10 @@ from mixapi.app import create_app
 class AuthAndErrorsTest(unittest.TestCase):
     def setUp(self) -> None:
         self.client = TestClient(create_app())
+        self.client.__enter__()
+
+    def tearDown(self) -> None:
+        self.client.__exit__(None, None, None)
 
     def test_missing_api_key_returns_normalized_error(self) -> None:
         response = self.client.get("/v1/models")
