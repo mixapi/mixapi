@@ -65,6 +65,15 @@ def capability_unsupported(code: str, message: str) -> MixAPIError:
     )
 
 
+def structured_output_error(code: str, message: str) -> MixAPIError:
+    return MixAPIError(
+        type="structured_output_error",
+        code=code,
+        message=message,
+        status_code=422,
+    )
+
+
 def quota_exceeded(code: str, message: str) -> MixAPIError:
     return MixAPIError(
         type="quota_exceeded",

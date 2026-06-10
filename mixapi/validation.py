@@ -4,12 +4,14 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from mixapi.errors import capability_unsupported, validation_error
+from mixapi.structured_output import InvalidResponseSchema, check_response_schema
 
 
 def validate_response_request(request_body: dict[str, Any], idempotency_key: str | None) -> None:
     stream = request_body.get("stream", False)
     if not isinstance(stream, bool):
         raise validation_error("invalid_stream", "Request field `stream` must be a boolean.")
+    _validate_response_schema(request_body, stream)
     if stream and idempotency_key:
         raise validation_error(
             "streaming_idempotency_unsupported",
@@ -26,6 +28,28 @@ def validate_response_request(request_body: dict[str, Any], idempotency_key: str
             "Streaming function tool calls are not supported.",
         )
     _validate_routing_budget(request_body.get("routing"))
+
+
+def _validate_response_schema(request_body: dict[str, Any], stream: bool) -> None:
+    response = request_body.get("response")
+    if not isinstance(response, dict):
+        return
+    response_format = response.get("format")
+    if not isinstance(response_format, dict) or response_format.get("type") != "json_schema":
+        return
+
+    try:
+        check_response_schema(response_format.get("json_schema"))
+    except InvalidResponseSchema as error:
+        raise validation_error(
+            "invalid_json_schema",
+            "Response JSON Schema must be a valid Draft 2020-12 schema object.",
+        ) from error
+    if stream:
+        raise capability_unsupported(
+            "streaming_structured_output_unsupported",
+            "Streaming is not supported for validated structured output.",
+        )
 
 
 def validate_embedding_request(request_body: dict[str, Any]) -> None:

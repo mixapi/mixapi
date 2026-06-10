@@ -1,7 +1,9 @@
 import unittest
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from mixapi.adapters import DeterministicProviderAdapter
 from mixapi.app import create_app
 
 
@@ -133,6 +135,80 @@ class RequestValidationTest(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["error"]["code"], "invalid_max_output_tokens")
         self.assertEqual(len(app.state.usage_ledger.events()), 0)
+
+    def test_response_rejects_malformed_json_schema_before_dispatch(self) -> None:
+        client = TestClient(create_app())
+
+        with patch.object(
+            DeterministicProviderAdapter,
+            "dispatch_response",
+            autospec=True,
+        ) as dispatch:
+            response = client.post(
+                "/v1/responses",
+                headers=AUTH_HEADERS,
+                json=_structured_request({"type": 7}),
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["type"], "validation_error")
+        self.assertEqual(response.json()["error"]["code"], "invalid_json_schema")
+        dispatch.assert_not_called()
+
+    def test_response_rejects_non_object_json_schema_before_dispatch(self) -> None:
+        client = TestClient(create_app())
+
+        with patch.object(
+            DeterministicProviderAdapter,
+            "dispatch_response",
+            autospec=True,
+        ) as dispatch:
+            response = client.post(
+                "/v1/responses",
+                headers=AUTH_HEADERS,
+                json=_structured_request("not-an-object"),
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["code"], "invalid_json_schema")
+        dispatch.assert_not_called()
+
+    def test_response_rejects_streaming_json_schema_before_dispatch(self) -> None:
+        request_body = _structured_request({"type": "object"})
+        request_body["stream"] = True
+        client = TestClient(create_app())
+
+        with patch.object(
+            DeterministicProviderAdapter,
+            "start_response_stream",
+            autospec=True,
+        ) as start_stream:
+            response = client.post(
+                "/v1/responses",
+                headers=AUTH_HEADERS,
+                json=request_body,
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["type"], "capability_unsupported")
+        self.assertEqual(
+            response.json()["error"]["code"],
+            "streaming_structured_output_unsupported",
+        )
+        start_stream.assert_not_called()
+
+
+def _structured_request(schema) -> dict[str, object]:
+    return {
+        "model": "mixapi/balanced-chat",
+        "input": "Return JSON",
+        "response": {
+            "format": {
+                "type": "json_schema",
+                "json_schema": schema,
+            }
+        },
+    }
 
 
 if __name__ == "__main__":
