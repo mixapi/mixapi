@@ -250,5 +250,5 @@ def test_intent_write_failure_prevents_provider_dispatch(
             json={"model": "mixapi/balanced-chat", "input": "do not dispatch"},
         )
 
-    assert response.status_code == 500
+    assert response.status_code == 503
     assert dispatched is False

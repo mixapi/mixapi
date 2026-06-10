@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from typing import Any
+
 from mixapi.models import LogicalModel, ProviderModel
+from mixapi.snapshots import ConfigurationSnapshot
 
 
 def default_catalog() -> dict[str, LogicalModel]:
@@ -136,3 +139,133 @@ def default_catalog() -> dict[str, LogicalModel]:
             candidates=embedding_candidates,
         ),
     }
+
+
+def catalog_from_snapshot(snapshot: ConfigurationSnapshot) -> dict[str, LogicalModel]:
+    providers = {provider.id: provider for provider in snapshot.providers}
+    candidates_by_model: dict[str, list[ProviderModel]] = {
+        model.id: [] for model in snapshot.logical_models
+    }
+    for candidate in sorted(
+        snapshot.candidates,
+        key=lambda item: (item.logical_model_id, item.priority, item.id),
+    ):
+        provider = providers[candidate.provider_connection_id]
+        candidates_by_model[candidate.logical_model_id].append(
+            ProviderModel(
+                id=candidate.id,
+                provider=_runtime_provider_name(provider.protocol),
+                provider_model_id=candidate.upstream_model_id,
+                logical_model_id=candidate.logical_model_id,
+                status=candidate.status,
+                context_window_tokens=candidate.context_window_tokens,
+                max_output_tokens=candidate.max_output_tokens,
+                input_modalities=candidate.input_modalities,
+                output_modalities=candidate.output_modalities,
+                tool_modes=candidate.tool_modes,
+                schema_support=candidate.schema_support,
+                streaming_support=candidate.streaming_support,
+                embeddings_support=candidate.embeddings_support,
+                retention_class=candidate.retention_class,
+                regions=candidate.regions,
+                pricing=candidate.pricing,
+                native_features=candidate.native_features,
+                unsupported_parameters=candidate.unsupported_parameters,
+                provider_connection_id=candidate.provider_connection_id,
+                priority=candidate.priority,
+                weight=candidate.weight,
+            )
+        )
+    return {
+        model.id: LogicalModel(
+            id=model.id,
+            status=model.status,
+            description=model.description,
+            candidates=tuple(candidates_by_model[model.id]),
+        )
+        for model in snapshot.logical_models
+    }
+
+
+def default_seed_document(*, credential: str) -> dict[str, Any]:
+    provider_specs = {
+        "openai": {
+            "id": "provider_openai",
+            "name": "OpenAI default",
+            "protocol": "openai-compatible",
+            "base_url": "https://api.openai.com/v1",
+        },
+        "anthropic": {
+            "id": "provider_anthropic",
+            "name": "Anthropic default",
+            "protocol": "anthropic",
+            "base_url": "https://api.anthropic.com",
+        },
+        "gemini": {
+            "id": "provider_gemini",
+            "name": "Gemini default",
+            "protocol": "gemini",
+            "base_url": "https://generativelanguage.googleapis.com",
+        },
+        "ollama": {
+            "id": "provider_ollama",
+            "name": "Ollama default",
+            "protocol": "ollama",
+            "base_url": "https://ollama.example",
+        },
+    }
+    catalog = default_catalog()
+    return {
+        "schema_version": 1,
+        "providers": [
+            {
+                **spec,
+                "credential": credential,
+                "timeout_seconds": "30",
+                "status": "active",
+                "priority": 100,
+                "weight": 1,
+                "metadata": {},
+            }
+            for spec in provider_specs.values()
+        ],
+        "logical_models": [
+            {
+                "id": model.id,
+                "description": model.description,
+                "aliases": [],
+                "status": model.status,
+            }
+            for model in catalog.values()
+        ],
+        "candidates": [
+            {
+                "id": candidate.id,
+                "logical_model_id": candidate.logical_model_id,
+                "provider_connection_id": provider_specs[candidate.provider]["id"],
+                "upstream_model_id": candidate.provider_model_id,
+                "status": candidate.status,
+                "priority": candidate.priority,
+                "weight": candidate.weight,
+                "context_window_tokens": candidate.context_window_tokens,
+                "max_output_tokens": candidate.max_output_tokens,
+                "input_modalities": list(candidate.input_modalities),
+                "output_modalities": list(candidate.output_modalities),
+                "tool_modes": list(candidate.tool_modes),
+                "schema_support": candidate.schema_support,
+                "streaming_support": candidate.streaming_support,
+                "embeddings_support": candidate.embeddings_support,
+                "retention_class": candidate.retention_class,
+                "regions": list(candidate.regions),
+                "pricing": candidate.pricing,
+                "native_features": list(candidate.native_features),
+                "unsupported_parameters": list(candidate.unsupported_parameters),
+            }
+            for model in catalog.values()
+            for candidate in model.candidates
+        ],
+    }
+
+
+def _runtime_provider_name(protocol: str) -> str:
+    return "openai" if protocol == "openai-compatible" else protocol

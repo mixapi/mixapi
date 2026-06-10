@@ -52,6 +52,7 @@ class PostgresConfigurationRepository:
     def create_provider(
         self,
         *,
+        provider_id: str | None = None,
         name: str,
         protocol: str,
         base_url: str,
@@ -63,7 +64,7 @@ class PostgresConfigurationRepository:
         weight: int = 1,
         metadata: dict[str, Any] | None = None,
     ) -> ConfigurationMutationResult[ProviderConnection]:
-        provider_id = f"provider_{uuid.uuid4().hex}"
+        provider_id = provider_id or f"provider_{uuid.uuid4().hex}"
         _validate_provider(protocol, base_url, timeout_seconds, status, weight, self._allow_private_upstreams)
         envelope = self._cipher.encrypt(
             credential,
@@ -457,6 +458,7 @@ class PostgresConfigurationRepository:
     def create_candidate(
         self,
         *,
+        candidate_id: str | None = None,
         logical_model_id: str,
         provider_connection_id: str,
         upstream_model_id: str,
@@ -479,7 +481,7 @@ class PostgresConfigurationRepository:
         unsupported_parameters: Iterable[str] = (),
     ) -> ConfigurationMutationResult[ModelCandidateRecord]:
         _validate_candidate(status, weight, context_window_tokens, max_output_tokens, schema_support)
-        candidate_id = f"candidate_{uuid.uuid4().hex}"
+        candidate_id = candidate_id or f"candidate_{uuid.uuid4().hex}"
         try:
             with self._pool.connection() as connection:
                 row = connection.execute(
@@ -689,6 +691,13 @@ class PostgresConfigurationRepository:
                 WHERE status = 'published'
                 ORDER BY version DESC LIMIT 1
                 """
+            ).fetchone()
+        return _version_from_row(row) if row is not None else None
+
+    def latest_configuration_version(self) -> ConfigurationVersion | None:
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM configuration_versions ORDER BY version DESC LIMIT 1"
             ).fetchone()
         return _version_from_row(row) if row is not None else None
 

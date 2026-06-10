@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 import os
 from contextlib import asynccontextmanager
@@ -12,7 +13,7 @@ from typing import Any
 
 from fastapi import Body, Depends, Request
 from fastapi import FastAPI
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from mixapi.adapters import (
     AdapterResponse,
@@ -38,12 +39,14 @@ from mixapi.auth import (
     require_scope,
 )
 from mixapi.auth_cache import RedisAuthCache
+from mixapi.bootstrap import ReadinessService
 from mixapi.budget import BudgetService
-from mixapi.catalog import default_catalog
+from mixapi.catalog import catalog_from_snapshot
 from mixapi.circuits import CircuitBreaker
 from mixapi.errors import (
     MixAPIError,
     budget_exceeded,
+    configuration_unavailable,
     error_response,
     provider_rate_limited,
     provider_unavailable,
@@ -136,6 +139,7 @@ def create_app(
             postgres_pool.close()
             raise
         try:
+            await asyncio.to_thread(configuration_rebuild_worker.run_once)
             await managed_workers.start()
             yield
         finally:
@@ -144,7 +148,6 @@ def create_app(
             postgres_pool.close()
 
     app = FastAPI(title="MixAPI", version="0.1.0", lifespan=lifespan)
-    catalog = default_catalog()
     deterministic_adapter = DeterministicProviderAdapter(
         failed_response_providers=failed_response_providers
     )
@@ -265,6 +268,16 @@ def create_app(
         lease_seconds=configured_settings.outbox_claim_lease_seconds,
     )
     configuration_rebuild_worker = ConfigurationRebuildWorker(configuration_publisher)
+    readiness = ReadinessService(
+        postgres_pool,
+        redis_runtime,
+        snapshot_store,
+        credential_cipher,
+    )
+
+    def active_catalog() -> dict[str, Any]:
+        return catalog_from_snapshot(readiness.require_snapshot())
+
     managed_workers = ManagedWorkers(
         (
             WorkerJob(
@@ -314,6 +327,15 @@ def create_app(
     app.state.snapshot_store = snapshot_store
     app.state.configuration_publisher = configuration_publisher
     app.state.workers = managed_workers
+    app.state.readiness = readiness
+
+    @app.middleware("http")
+    async def require_application_readiness(request: Request, call_next):
+        if request.url.path.startswith("/v1/"):
+            status = readiness.check()
+            if not status.ready:
+                return error_response(request, configuration_unavailable())
+        return await call_next(request)
 
     @app.middleware("http")
     async def attach_request_context(request: Request, call_next):
@@ -325,11 +347,28 @@ def create_app(
     async def mixapi_error_handler(request: Request, error: MixAPIError):
         return error_response(request, error)
 
+    @app.get("/health/live", include_in_schema=False)
+    def health_live() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.get("/health/ready", include_in_schema=False)
+    def health_ready() -> JSONResponse:
+        status = readiness.check()
+        return JSONResponse(
+            status_code=200 if status.ready else 503,
+            content={
+                "status": "ready" if status.ready else "not_ready",
+                "checks": status.checks,
+                "active_version": status.active_version,
+            },
+        )
+
     @app.get("/v1/models")
     def list_models(
         principal: Principal = Depends(authenticate_service),
     ) -> dict[str, object]:
         require_scope(principal, "models:read")
+        catalog = active_catalog()
         return {
             "object": "list",
             "data": [
@@ -347,6 +386,7 @@ def create_app(
         principal: Principal = Depends(authenticate_service),
     ) -> Any:
         require_scope(principal, "responses:create")
+        catalog = active_catalog()
         idempotency_key = request.headers.get("idempotency-key")
         validate_response_request(request_body, idempotency_key=idempotency_key)
         if replay := idempotency_store.replay(principal, "responses", idempotency_key, request_body):
@@ -645,6 +685,7 @@ def create_app(
         principal: Principal = Depends(authenticate_service),
     ) -> dict[str, Any]:
         require_scope(principal, "embeddings:create")
+        catalog = active_catalog()
         idempotency_key = request.headers.get("idempotency-key")
         validate_embedding_request(request_body)
         if replay := idempotency_store.replay(principal, "embeddings", idempotency_key, request_body):
@@ -926,7 +967,7 @@ def create_app(
         request_body: dict[str, Any] = Body(default_factory=dict),
         admin: AdminPrincipal = Depends(authenticate_admin),
     ) -> dict[str, Any]:
-        values = _parse_api_key_create(request_body, catalog)
+        values = _parse_api_key_create(request_body, active_catalog())
         created = control_plane.create_api_key(**values, actor_id=admin.actor_id)
         return {**created.record.public_dict(), "secret": created.secret}
 
@@ -951,7 +992,7 @@ def create_app(
         request_body: dict[str, Any] = Body(default_factory=dict),
         admin: AdminPrincipal = Depends(authenticate_admin),
     ) -> dict[str, Any]:
-        changes = _parse_api_key_patch(request_body, catalog)
+        changes = _parse_api_key_patch(request_body, active_catalog())
         return control_plane.update_api_key(
             api_key_id,
             changes,
@@ -980,7 +1021,7 @@ def create_app(
                 "invalid_model_allowlist",
                 "Model allowlist payload must contain only `models`.",
             )
-        models = _parse_model_allowlist(request_body.get("models"), catalog)
+        models = _parse_model_allowlist(request_body.get("models"), active_catalog())
         return control_plane.set_tenant_model_allowlist(
             tenant_id,
             models,
