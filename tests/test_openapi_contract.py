@@ -1,8 +1,13 @@
+import json
 import unittest
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from mixapi.app import create_app
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class OpenAPIContractTest(unittest.TestCase):
@@ -127,6 +132,11 @@ class OpenAPIContractTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), self.contract)
+
+    def test_checked_in_contract_matches_application_contract(self) -> None:
+        expected = json.dumps(self.contract, indent=2, sort_keys=True) + "\n"
+
+        self.assertEqual((ROOT / "openapi" / "openapi.json").read_text(), expected)
 
 
 if __name__ == "__main__":
