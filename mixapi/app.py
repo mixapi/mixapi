@@ -1170,7 +1170,16 @@ def _dispatch_response_with_fallback(
                     tuple(billable_dispatches),
                 )
 
+            validation_started_at = monotonic()
             validation = validate_output(response.output_text, schema)
+            _record_structured_output_validation(
+                observability=observability,
+                trace_id=trace_id,
+                candidate=candidate,
+                retry_number=dispatch_index,
+                valid=validation.valid,
+                started_at=validation_started_at,
+            )
             if validation.valid:
                 return ResponseDispatchOutcome(
                     response,
@@ -1722,6 +1731,38 @@ def _record_provider_attempt(
         trace_id=trace_id,
         status=status,
         duration_ms=duration_ms,
+        attributes=attributes,
+    )
+
+
+def _record_structured_output_validation(
+    observability: Observability,
+    trace_id: str,
+    candidate: ProviderModel,
+    retry_number: int,
+    valid: bool,
+    started_at: float,
+) -> None:
+    attributes: dict[str, str | int] = {
+        "endpoint": "responses",
+        "provider": candidate.provider,
+        "provider_model": candidate.provider_model_id,
+        "retry_number": retry_number,
+    }
+    if not valid:
+        attributes["error_class"] = "schema_validation_failed"
+        observability.increment_counter(
+            "mixapi_structured_output_failures_total",
+            {
+                "provider": candidate.provider,
+                "provider_model": candidate.provider_model_id,
+            },
+        )
+    observability.record_span(
+        "structured_output.validate",
+        trace_id=trace_id,
+        status="ok" if valid else "error",
+        duration_ms=max((monotonic() - started_at) * 1000, 0),
         attributes=attributes,
     )
 

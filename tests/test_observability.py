@@ -1,8 +1,10 @@
 import unittest
 from decimal import Decimal
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from mixapi.adapters import AdapterResponse, DeterministicProviderAdapter
 from mixapi.app import create_app
 from mixapi.observability import InMemoryObservability
 
@@ -349,6 +351,75 @@ class ObservabilityEndpointTest(unittest.TestCase):
         ]
         self.assertEqual(spans[0].status, "error")
         self.assertEqual(dict(spans[0].attributes)["error_class"], "api_key_budget_exceeded")
+
+    def test_structured_output_validation_records_safe_spans_and_failure_counter(self) -> None:
+        responses = iter(
+            (
+                AdapterResponse("private invalid generated output", 2, 3),
+                AdapterResponse('{"ok":true}', 4, 5),
+            )
+        )
+        app = create_app()
+        client = TestClient(app)
+
+        with patch.object(
+            DeterministicProviderAdapter,
+            "dispatch_response",
+            autospec=True,
+            side_effect=lambda *_args: next(responses),
+        ):
+            response = client.post(
+                "/v1/responses",
+                headers={**AUTH_HEADERS, "traceparent": "trace_structured"},
+                json={
+                    "model": "mixapi/balanced-chat",
+                    "input": "private prompt text",
+                    "native": {"provider": "openai"},
+                    "response": {
+                        "format": {
+                            "type": "json_schema",
+                            "json_schema": {
+                                "type": "object",
+                                "properties": {"ok": {"type": "boolean"}},
+                                "required": ["ok"],
+                            },
+                        }
+                    },
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        spans = _spans(app, "structured_output.validate")
+        self.assertEqual([span.status for span in spans], ["error", "ok"])
+        self.assertEqual([span.trace_id for span in spans], ["trace_structured"] * 2)
+        self.assertEqual(
+            [dict(span.attributes)["retry_number"] for span in spans],
+            [0, 1],
+        )
+        self.assertEqual(
+            dict(spans[0].attributes),
+            {
+                "endpoint": "responses",
+                "error_class": "schema_validation_failed",
+                "provider": "openai",
+                "provider_model": "gpt-4.1-mini",
+                "retry_number": 0,
+            },
+        )
+        counter = _metric_samples(
+            app,
+            "counter",
+            "mixapi_structured_output_failures_total",
+        )[0]
+        self.assertEqual(counter.value, 1)
+        self.assertEqual(
+            dict(counter.labels),
+            {"provider": "openai", "provider_model": "gpt-4.1-mini"},
+        )
+        telemetry = repr((*spans, counter))
+        self.assertNotIn("private prompt text", telemetry)
+        self.assertNotIn("private invalid generated output", telemetry)
+        self.assertNotIn("properties", telemetry)
 
 
 def _metric_samples(app, kind: str, name: str):
