@@ -388,8 +388,25 @@ def create_app(
                 request_body["model"],
                 error.failed_attempts,
             )
-            budget.release(reservation)
-            quota.release_tokens(token_reservation)
+            if error.billable_dispatches:
+                input_tokens, output_tokens, cost = _billable_dispatch_totals(
+                    error.billable_dispatches
+                )
+                budget.reconcile(reservation, cost)
+                quota.reconcile_tokens(
+                    token_reservation,
+                    input_tokens + output_tokens,
+                )
+                _record_billable_response_usage(
+                    usage_ledger=usage_ledger,
+                    dispatches=error.billable_dispatches,
+                    request_id=request.state.request_id,
+                    principal=principal,
+                    logical_model=request_body["model"],
+                )
+            else:
+                budget.release(reservation)
+                quota.release_tokens(token_reservation)
             route_decision_store.record(
                 RouteDecisionRecord(
                     request_id=request.state.request_id,
@@ -423,31 +440,20 @@ def create_app(
         )
 
         response_id = f"resp_{uuid.uuid4().hex}"
-        cost = _estimate_cost(
-            input_tokens=adapter_response.input_tokens,
-            output_tokens=adapter_response.output_tokens,
-            input_price=selected_candidate.pricing.get("input_per_million", "0"),
-            output_price=selected_candidate.pricing.get("output_per_million", "0"),
+        input_tokens, output_tokens, cost = _billable_dispatch_totals(
+            outcome.billable_dispatches
         )
         budget.reconcile(reservation, cost)
         quota.reconcile_tokens(
             token_reservation,
-            adapter_response.input_tokens + adapter_response.output_tokens,
+            input_tokens + output_tokens,
         )
-        usage_ledger.record(
-            UsageEvent(
-                request_id=request.state.request_id,
-                tenant_id=principal.tenant_id,
-                project_id=principal.project_id,
-                api_key_id=principal.api_key_id,
-                endpoint="responses",
-                logical_model=request_body["model"],
-                provider=selected_candidate.provider,
-                provider_model=selected_candidate.provider_model_id,
-                input_tokens=adapter_response.input_tokens,
-                output_tokens=adapter_response.output_tokens,
-                cost_usd=cost,
-            )
+        _record_billable_response_usage(
+            usage_ledger=usage_ledger,
+            dispatches=outcome.billable_dispatches,
+            request_id=request.state.request_id,
+            principal=principal,
+            logical_model=request_body["model"],
         )
         attempts = _route_attempts(
             failed_attempts=failed_attempts,
@@ -477,12 +483,12 @@ def create_app(
             "output": _response_output(adapter_response),
             "output_text": adapter_response.output_text,
             "usage": {
-                "input_tokens": adapter_response.input_tokens,
-                "output_tokens": adapter_response.output_tokens,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
                 "cached_input_tokens": 0,
                 "billable_units": [
-                    {"type": "input_tokens", "quantity": adapter_response.input_tokens},
-                    {"type": "output_tokens", "quantity": adapter_response.output_tokens},
+                    {"type": "input_tokens", "quantity": input_tokens},
+                    {"type": "output_tokens", "quantity": output_tokens},
                 ],
             },
             "cost": {
@@ -932,9 +938,10 @@ def _budget_eligible_candidates(
     eligible: list[Any] = []
     rejected: list[dict[str, str]] = []
     estimates: list[Decimal] = []
+    structured = endpoint == "responses" and response_schema(request_body) is not None
     for candidate in candidates:
         estimate = _estimate_candidate_request_cost(request_body, candidate, endpoint)
-        if request_limit is not None and estimate > request_limit:
+        if request_limit is not None and not structured and estimate > request_limit:
             rejected.append(
                 {
                     "provider": candidate.provider,
@@ -951,7 +958,17 @@ def _budget_eligible_candidates(
             "request_budget_exceeded",
             "No eligible provider fits the request cost limit.",
         )
-    return tuple(eligible), tuple(rejected), max(estimates, default=Decimal("0"))
+    estimated_cost = (
+        sum(estimates, Decimal("0")) * 2
+        if structured
+        else max(estimates, default=Decimal("0"))
+    )
+    if request_limit is not None and structured and estimated_cost > request_limit:
+        raise budget_exceeded(
+            "request_budget_exceeded",
+            "No eligible provider fits the request cost limit.",
+        )
+    return tuple(eligible), tuple(rejected), estimated_cost
 
 
 def _circuit_eligible_candidates(
@@ -1055,14 +1072,13 @@ def _estimate_request_tokens(request_body: dict[str, Any], candidates, endpoint:
         return count_tokens(embedding_text(request_body.get("input", "")))
 
     input_tokens = count_tokens(extract_text(request_body.get("input", "")))
-    output_tokens = max(
-        (
-            request_body.get("max_output_tokens", candidate.max_output_tokens)
-            for candidate in candidates
-        ),
-        default=0,
-    )
-    return input_tokens + output_tokens
+    candidate_tokens = [
+        input_tokens + request_body.get("max_output_tokens", candidate.max_output_tokens)
+        for candidate in candidates
+    ]
+    if response_schema(request_body) is not None:
+        return sum(candidate_tokens) * 2
+    return max(candidate_tokens, default=input_tokens)
 
 
 def _reserve_quotas(
@@ -1518,6 +1534,56 @@ def _response_usage_event(
         output_tokens=output_tokens,
         cost_usd=cost,
     )
+
+
+def _billable_dispatch_totals(
+    dispatches: list[BillableDispatch] | tuple[BillableDispatch, ...],
+) -> tuple[int, int, Decimal]:
+    input_tokens = sum(dispatch.response.input_tokens for dispatch in dispatches)
+    output_tokens = sum(dispatch.response.output_tokens for dispatch in dispatches)
+    cost = sum(
+        (
+            _estimate_cost(
+                input_tokens=dispatch.response.input_tokens,
+                output_tokens=dispatch.response.output_tokens,
+                input_price=dispatch.candidate.pricing.get("input_per_million", "0"),
+                output_price=dispatch.candidate.pricing.get("output_per_million", "0"),
+            )
+            for dispatch in dispatches
+        ),
+        Decimal("0"),
+    )
+    return input_tokens, output_tokens, cost
+
+
+def _record_billable_response_usage(
+    usage_ledger: Any,
+    dispatches: list[BillableDispatch] | tuple[BillableDispatch, ...],
+    request_id: str,
+    principal: Principal,
+    logical_model: str,
+) -> None:
+    for dispatch in dispatches:
+        usage_ledger.record(
+            UsageEvent(
+                request_id=request_id,
+                tenant_id=principal.tenant_id,
+                project_id=principal.project_id,
+                api_key_id=principal.api_key_id,
+                endpoint="responses",
+                logical_model=logical_model,
+                provider=dispatch.candidate.provider,
+                provider_model=dispatch.candidate.provider_model_id,
+                input_tokens=dispatch.response.input_tokens,
+                output_tokens=dispatch.response.output_tokens,
+                cost_usd=_estimate_cost(
+                    input_tokens=dispatch.response.input_tokens,
+                    output_tokens=dispatch.response.output_tokens,
+                    input_price=dispatch.candidate.pricing.get("input_per_million", "0"),
+                    output_price=dispatch.candidate.pricing.get("output_per_million", "0"),
+                ),
+            )
+        )
 
 
 def _response_payload(

@@ -1,7 +1,9 @@
 import unittest
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from mixapi.adapters import DeterministicProviderAdapter
 from mixapi.app import create_app
 
 
@@ -146,6 +148,35 @@ class QuotaUsageEmbeddingsTest(unittest.TestCase):
         self.assertEqual(first.status_code, 200)
         self.assertEqual(second.status_code, 429)
         self.assertEqual(second.json()["error"]["code"], "token_quota_exceeded")
+
+    def test_structured_request_reserves_tokens_for_corrective_retry(self) -> None:
+        client = TestClient(create_app(token_quota_limit=15))
+
+        with patch.object(
+            DeterministicProviderAdapter,
+            "dispatch_response",
+            autospec=True,
+        ) as dispatch:
+            response = client.post(
+                "/v1/responses",
+                headers=AUTH_HEADERS,
+                json={
+                    "model": "mixapi/balanced-chat",
+                    "input": "Return JSON",
+                    "max_output_tokens": 8,
+                    "native": {"provider": "openai"},
+                    "response": {
+                        "format": {
+                            "type": "json_schema",
+                            "json_schema": {"type": "object"},
+                        }
+                    },
+                },
+            )
+
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.json()["error"]["code"], "token_quota_exceeded")
+        dispatch.assert_not_called()
 
 
 if __name__ == "__main__":

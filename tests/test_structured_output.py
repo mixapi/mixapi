@@ -251,8 +251,69 @@ class StructuredOutputEndpointTest(unittest.TestCase):
         self.assertEqual(response.json()["error"]["code"], "schema_validation_failed")
         self.assertIn("$.ok", response.json()["error"]["message"])
         self.assertEqual(dispatch.call_count, 4)
+        self.assertEqual(len(app.state.usage_ledger.events()), 4)
         self.assertFalse(app.state.circuits.is_open("openai", "gpt-4.1-mini"))
         self.assertFalse(app.state.circuits.is_open("gemini", "gemini-2.5-flash"))
+
+    def test_retry_success_aggregates_usage_cost_and_ledger_events(self) -> None:
+        responses = iter(
+            (
+                AdapterResponse("not-json", 2, 3),
+                AdapterResponse('{"ok":true}', 4, 5),
+            )
+        )
+        app = create_app()
+        client = TestClient(app)
+
+        with patch.object(
+            DeterministicProviderAdapter,
+            "dispatch_response",
+            autospec=True,
+            side_effect=lambda *_args: next(responses),
+        ):
+            response = client.post(
+                "/v1/responses",
+                headers={**AUTH_HEADERS, "X-Request-ID": "req_structured_retry"},
+                json=_strict_request(provider="openai"),
+            )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["usage"]["input_tokens"], 6)
+        self.assertEqual(body["usage"]["output_tokens"], 8)
+        self.assertEqual(body["cost"]["provider_cost_usd"], "0.00001520")
+        events = app.state.usage_ledger.events()
+        self.assertEqual(len(events), 2)
+        self.assertEqual([event.request_id for event in events], ["req_structured_retry"] * 2)
+        self.assertEqual([event.input_tokens for event in events], [2, 4])
+        self.assertEqual([event.output_tokens for event in events], [3, 5])
+        self.assertEqual([event.provider for event in events], ["openai", "openai"])
+
+    def test_fallback_records_each_billable_provider_dispatch(self) -> None:
+        def dispatch(_adapter, _request_body, candidate):
+            if candidate.provider == "openai":
+                return AdapterResponse("not-json", 1, 1)
+            return AdapterResponse('{"ok":true}', 2, 2)
+
+        app = create_app()
+        client = TestClient(app)
+        with patch.object(
+            DeterministicProviderAdapter,
+            "dispatch_response",
+            autospec=True,
+            side_effect=dispatch,
+        ):
+            response = client.post(
+                "/v1/responses",
+                headers=AUTH_HEADERS,
+                json=_strict_request(),
+            )
+
+        self.assertEqual(response.status_code, 200)
+        events = app.state.usage_ledger.events()
+        self.assertEqual([event.provider for event in events], ["openai", "openai", "gemini"])
+        self.assertEqual(response.json()["usage"]["input_tokens"], 4)
+        self.assertEqual(response.json()["usage"]["output_tokens"], 4)
 
 
 def _strict_request(provider: str | None = None) -> dict[str, object]:

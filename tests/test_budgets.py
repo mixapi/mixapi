@@ -1,8 +1,10 @@
 import os
 import unittest
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from mixapi.adapters import DeterministicProviderAdapter
 from mixapi.app import create_app
 
 
@@ -74,6 +76,65 @@ class BudgetTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["error"]["code"], "invalid_max_cost_usd")
+
+    def test_structured_request_cost_limit_reserves_corrective_retry(self) -> None:
+        client = TestClient(create_app())
+
+        with patch.object(
+            DeterministicProviderAdapter,
+            "dispatch_response",
+            autospec=True,
+        ) as dispatch:
+            response = client.post(
+                "/v1/responses",
+                headers=AUTH_HEADERS,
+                json={
+                    "model": "mixapi/balanced-chat",
+                    "input": "Return JSON",
+                    "max_output_tokens": 8,
+                    "routing": {"max_cost_usd": "0.00002000"},
+                    "native": {"provider": "openai"},
+                    "response": {
+                        "format": {
+                            "type": "json_schema",
+                            "json_schema": {"type": "object"},
+                        }
+                    },
+                },
+            )
+
+        self.assertEqual(response.status_code, 402)
+        self.assertEqual(response.json()["error"]["code"], "request_budget_exceeded")
+        dispatch.assert_not_called()
+
+    def test_api_key_budget_reserves_structured_corrective_retry(self) -> None:
+        client = TestClient(create_app(budget_limit_usd="0.00002000"))
+
+        with patch.object(
+            DeterministicProviderAdapter,
+            "dispatch_response",
+            autospec=True,
+        ) as dispatch:
+            response = client.post(
+                "/v1/responses",
+                headers=AUTH_HEADERS,
+                json={
+                    "model": "mixapi/balanced-chat",
+                    "input": "Return JSON",
+                    "max_output_tokens": 8,
+                    "native": {"provider": "openai"},
+                    "response": {
+                        "format": {
+                            "type": "json_schema",
+                            "json_schema": {"type": "object"},
+                        }
+                    },
+                },
+            )
+
+        self.assertEqual(response.status_code, 402)
+        self.assertEqual(response.json()["error"]["code"], "api_key_budget_exceeded")
+        dispatch.assert_not_called()
 
 
 if __name__ == "__main__":
