@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from fastapi.testclient import TestClient
 
-from mixapi.app import create_app
+from tests.app_factory import create_app
 from mixapi.configuration import LogicalModel, ModelCandidate, ProviderConnection, StoredConfiguration
 from mixapi.secrets import CredentialAAD, CredentialCipher
 from mixapi.snapshots import ConfigurationSnapshot

@@ -5,9 +5,9 @@ from dataclasses import dataclass
 from types import MappingProxyType
 
 from mixapi.adapter_factory import AdapterFactory, SnapshotAdapterResolver
-from mixapi.catalog import catalog_from_snapshot
 from mixapi.models import LogicalModel
 from mixapi.observability import Observability, VersionedObservability
+from mixapi.routing_catalog import catalog_from_snapshot
 from mixapi.snapshots import ConfigurationSnapshot
 
 

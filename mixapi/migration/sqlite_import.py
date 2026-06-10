@@ -16,8 +16,8 @@ from psycopg import Connection
 from psycopg.types.json import Jsonb
 
 from mixapi.bootstrap import BootstrapDocument
-from mixapi.catalog import default_seed_document
 from mixapi.configuration import ProviderConnection
+from mixapi.migration.legacy_catalog import default_seed_document
 from mixapi.postgres import PostgresPool
 from mixapi.publication import ConfigurationPublisher, PublicationError
 from mixapi.repositories.configuration import PostgresConfigurationRepository

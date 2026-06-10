@@ -23,6 +23,7 @@ This backlog closes the highest-priority gaps between the current implementation
 ## P1 Execution Queue
 
 - [x] Add provider-neutral Draft 2020-12 structured-output validation with corrective retry, fallback, aggregate accounting, observability, and contract coverage.
+- [x] Replace SQLite and in-memory runtime state with mandatory PostgreSQL/Redis, dynamic multi-vendor model mappings, versioned publication, and an idempotent legacy migration command.
 
 ## Completion Rule
 

@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
-
-from mixapi.errors import not_found
 
 
 @dataclass(frozen=True)
@@ -39,17 +37,3 @@ class RouteDecisionRecord:
             "rejected_candidates": list(self.rejected_candidates),
             "fallback_used": len(self.attempts) > 1,
         }
-
-
-@dataclass
-class InMemoryRouteDecisionStore:
-    _records: dict[tuple[str, str], RouteDecisionRecord] = field(default_factory=dict)
-
-    def record(self, record: RouteDecisionRecord) -> None:
-        self._records[(record.tenant_id, record.request_id)] = record
-
-    def get_public(self, request_id: str, tenant_id: str) -> dict[str, Any]:
-        record = self._records.get((tenant_id, request_id))
-        if record is None:
-            raise not_found("route_decision_not_found", "Route decision was not found.")
-        return record.public_dict()

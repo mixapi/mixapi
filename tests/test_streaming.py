@@ -5,14 +5,19 @@ from decimal import Decimal
 from fastapi.testclient import TestClient
 
 from mixapi.adapters import ProviderStream, ProviderStreamEvent
-from mixapi.app import _native_response_event_stream, create_app
+from mixapi.app import _native_response_event_stream
 from mixapi.auth import Principal
-from mixapi.catalog import default_catalog
+from mixapi.migration.legacy_catalog import default_catalog
 from mixapi.observability import InMemoryObservability
-from mixapi.route_decisions import InMemoryRouteDecisionStore
 from mixapi.streaming import _text_deltas
-from mixapi.usage import InMemoryUsageLedger
-from tests.runtime_fakes import FakeBudgetService, FakeCircuitBreaker, FakeQuotaService
+from tests.app_factory import create_app
+from tests.runtime_fakes import (
+    FakeBudgetService,
+    FakeCircuitBreaker,
+    FakeQuotaService,
+    FakeRouteDecisionStore,
+    FakeUsageLedger,
+)
 
 
 AUTH_HEADERS = {"Authorization": "Bearer dev-key", "X-Request-ID": "req_stream_1"}
@@ -109,8 +114,8 @@ class StreamingTest(unittest.TestCase):
         reservation = budget.reserve(principal, Decimal("1"))
         quota = FakeQuotaService(token_limit=10)
         token_reservation = quota.reserve_tokens(principal, 8)
-        usage = InMemoryUsageLedger()
-        routes = InMemoryRouteDecisionStore()
+        usage = FakeUsageLedger()
+        routes = FakeRouteDecisionStore()
         event_stream = _native_response_event_stream(
             provider_stream=provider_stream,
             selected_candidate=candidate,

@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 
 import mixapi.app as app_module
 from mixapi.auth import Principal
-from mixapi.app import create_app
+from tests.app_factory import create_app
 from mixapi.postgres import PostgresPool
 from mixapi.repositories.budgets import PostgresBudgetService
 from mixapi.repositories.route_decisions import PostgresRouteDecisionStore

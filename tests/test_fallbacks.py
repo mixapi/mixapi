@@ -4,30 +4,13 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from mixapi.adapters import DeterministicProviderAdapter, ProviderDispatchError
-from mixapi.app import create_app
+from tests.app_factory import create_app
 
 
 AUTH_HEADERS = {"Authorization": "Bearer dev-key"}
 
 
 class FallbacksTest(unittest.TestCase):
-    def test_failed_provider_configuration_remains_second_positional_argument(self) -> None:
-        app = create_app(None, {"openai"})
-        client = TestClient(app)
-
-        response = client.post(
-            "/v1/responses",
-            headers=AUTH_HEADERS,
-            json={
-                "model": "mixapi/balanced-chat",
-                "input": "Positional compatibility",
-                "native": {"provider": "openai"},
-            },
-        )
-
-        self.assertEqual(response.status_code, 503)
-        self.assertEqual(response.json()["error"]["code"], "all_candidates_failed")
-
     def test_response_falls_back_to_next_eligible_provider(self) -> None:
         app = create_app(failed_response_providers={"ollama"})
         client = TestClient(app)

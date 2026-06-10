@@ -22,7 +22,7 @@ def main() -> None:
         master_key_version=1,
         previous_master_keys={},
     )
-    contract = create_app(settings=settings).openapi()
+    contract = create_app(settings=settings, adapter_overrides={}).openapi()
     destination.write_text(json.dumps(contract, indent=2, sort_keys=True) + "\n")
 
 

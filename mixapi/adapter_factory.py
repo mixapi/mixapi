@@ -69,7 +69,7 @@ class AdapterFactory:
             return AnthropicProviderAdapter(
                 provider.base_url,
                 credential,
-                self._anthropic_version,
+                str(provider.metadata.get("api_version", self._anthropic_version)),
                 timeout,
             )
         if provider.protocol == "gemini":

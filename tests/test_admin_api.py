@@ -7,7 +7,7 @@ import psycopg
 import redis
 from fastapi.testclient import TestClient
 
-from mixapi.app import create_app
+from tests.app_factory import create_app
 
 
 ADMIN_HEADERS = {"Authorization": "Bearer admin-secret"}

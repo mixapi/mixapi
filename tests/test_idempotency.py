@@ -4,7 +4,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from mixapi.adapters import AdapterResponse, DeterministicProviderAdapter
-from mixapi.app import create_app
+from tests.app_factory import create_app
 
 
 AUTH_HEADERS = {

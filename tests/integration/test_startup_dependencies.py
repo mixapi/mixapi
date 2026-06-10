@@ -5,7 +5,7 @@ from dataclasses import replace
 import pytest
 from fastapi.testclient import TestClient
 
-from mixapi.app import create_app
+from tests.app_factory import create_app
 from mixapi.postgres import DependencyUnavailable
 from mixapi.settings import ConfigurationError, Settings
 

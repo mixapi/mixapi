@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import replace
 from decimal import Decimal
 
 from mixapi.budget import BudgetReservation
+from mixapi.errors import not_found
 from mixapi.quota import TokenReservation
 
 
@@ -68,3 +70,35 @@ class FakeCircuitBreaker:
 
     def record_success(self, provider, provider_model):
         self.opened_at = None
+
+
+class FakeUsageLedger:
+    def __init__(self) -> None:
+        self._events = []
+
+    def record(self, event):
+        recorded = replace(event, sequence_id=len(self._events) + 1)
+        self._events.append(recorded)
+        return recorded
+
+    def events(self, tenant_id=None):
+        if tenant_id is None:
+            return list(self._events)
+        return [event for event in self._events if event.tenant_id == tenant_id]
+
+
+class FakeRouteDecisionStore:
+    def __init__(self) -> None:
+        self._records = {}
+
+    def record(self, record) -> None:
+        self._records[(record.tenant_id, record.request_id)] = record
+
+    def get_public(self, request_id, tenant_id):
+        try:
+            return self._records[(tenant_id, request_id)].public_dict()
+        except KeyError as error:
+            raise not_found(
+                "route_decision_not_found",
+                "Route decision was not found.",
+            ) from error

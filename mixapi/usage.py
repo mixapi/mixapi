@@ -5,10 +5,9 @@ import binascii
 import csv
 import io
 import json
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
-from threading import Lock
 from typing import Any
 
 
@@ -84,45 +83,6 @@ class UsageQueryValidationError(ValueError):
         super().__init__(message)
         self.code = code
         self.message = message
-
-
-@dataclass
-class InMemoryUsageLedger:
-    _events: list[UsageEvent] = field(default_factory=list)
-    _next_sequence_id: int = 1
-    _lock: Lock = field(default_factory=Lock, init=False, repr=False)
-
-    def record(self, event: UsageEvent) -> None:
-        with self._lock:
-            self._events.append(replace(event, sequence_id=self._next_sequence_id))
-            self._next_sequence_id += 1
-
-    def events(self, tenant_id: str | None = None) -> list[UsageEvent]:
-        with self._lock:
-            if tenant_id is None:
-                return list(self._events)
-            return [event for event in self._events if event.tenant_id == tenant_id]
-
-    def query(self, query: UsageQuery) -> UsagePage:
-        with self._lock:
-            matching = sorted(
-                [
-                    event
-                    for event in self._events
-                    if event.tenant_id == query.tenant_id
-                    and (query.start_time is None or event.created_at >= query.start_time)
-                    and (query.end_time is None or event.created_at <= query.end_time)
-                    and event.sequence_id is not None
-                    and _after_usage_cursor(event, query)
-                ],
-                key=lambda event: (event.created_at, event.sequence_id or 0),
-            )
-        if query.limit is None:
-            return UsagePage(events=matching, has_more=False)
-        has_more = len(matching) > query.limit
-        return UsagePage(events=matching[: query.limit], has_more=has_more)
-
-
 def usage_response(
     events: list[UsageEvent],
     *,

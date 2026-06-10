@@ -11,7 +11,7 @@ import psycopg
 import pytest
 from fastapi.testclient import TestClient
 
-from mixapi.app import create_app
+from tests.app_factory import create_app
 from mixapi.configuration import ProviderConnection
 from mixapi.provider_testing import ProviderConnectionTester, ProviderTestResult
 from mixapi.secrets import CredentialAAD, CredentialCipher

@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-import uuid
 import os
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
 from time import monotonic
 from typing import Any
 
@@ -17,11 +16,6 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from mixapi.adapters import (
     AdapterResponse,
-    AnthropicProviderAdapter,
-    DeterministicProviderAdapter,
-    GeminiProviderAdapter,
-    OllamaProviderAdapter,
-    OpenAICompatibleProviderAdapter,
     ProviderDispatchError,
     ProviderStream,
     ProviderStreamEvent,
@@ -44,7 +38,6 @@ from mixapi.auth import (
 from mixapi.auth_cache import RedisAuthCache
 from mixapi.bootstrap import ReadinessService
 from mixapi.budget import BudgetService
-from mixapi.catalog import catalog_from_snapshot
 from mixapi.circuits import CircuitBreaker
 from mixapi.errors import (
     MixAPIError,
@@ -62,9 +55,6 @@ from mixapi.observability import InMemoryObservability, Observability, SafeObser
 from mixapi.postgres import PostgresPool
 from mixapi.provider_testing import ProviderConnectionTester
 from mixapi.publication import ConfigurationPublisher
-from mixapi.persistence import (
-    SQLiteDatabase,
-)
 from mixapi.quota import QuotaService, TokenReservation
 from mixapi.redis_runtime import RedisRuntime
 from mixapi.repositories.budgets import PostgresBudgetService
@@ -80,6 +70,7 @@ from mixapi.runtime.quota import RedisQuotaService
 from mixapi.runtime.snapshots import RedisSnapshotStore
 from mixapi.route_decisions import RouteDecisionRecord
 from mixapi.routing import plan_route
+from mixapi.routing_catalog import catalog_from_snapshot
 from mixapi.streaming import encode_sse
 from mixapi.structured_output import (
     CORRECTIVE_RETRY_TOKEN_RESERVE,
@@ -111,18 +102,7 @@ from mixapi.workers import (
 
 def create_app(
     request_quota_limit: int | None = None,
-    failed_response_providers: set[str] | None = None,
-    database_path: str | Path | None = None,
-    openai_base_url: str | None = None,
-    openai_api_key: str | None = None,
-    anthropic_base_url: str | None = None,
-    anthropic_api_key: str | None = None,
-    anthropic_version: str | None = None,
-    gemini_base_url: str | None = None,
-    gemini_api_key: str | None = None,
-    ollama_base_url: str | None = None,
-    ollama_api_key: str | None = None,
-    provider_timeout_seconds: float = 30.0,
+    adapter_overrides: dict[str, Any] | None = None,
     budget_limit_usd: Decimal | str | None = None,
     circuit_failure_threshold: int | None = None,
     circuit_recovery_seconds: float | None = None,
@@ -154,46 +134,6 @@ def create_app(
             postgres_pool.close()
 
     app = FastAPI(title="MixAPI", version="0.1.0", lifespan=lifespan)
-    deterministic_adapter = DeterministicProviderAdapter(
-        failed_response_providers=failed_response_providers
-    )
-    configured_openai_base_url = openai_base_url or os.getenv("MIXAPI_OPENAI_BASE_URL")
-    configured_openai_api_key = openai_api_key or os.getenv("MIXAPI_OPENAI_API_KEY")
-    configured_anthropic_base_url = anthropic_base_url or os.getenv("MIXAPI_ANTHROPIC_BASE_URL")
-    configured_anthropic_api_key = anthropic_api_key or os.getenv("MIXAPI_ANTHROPIC_API_KEY")
-    configured_anthropic_version = (
-        anthropic_version or os.getenv("MIXAPI_ANTHROPIC_VERSION", "2023-06-01")
-    )
-    configured_gemini_base_url = gemini_base_url or os.getenv("MIXAPI_GEMINI_BASE_URL")
-    configured_gemini_api_key = gemini_api_key or os.getenv("MIXAPI_GEMINI_API_KEY")
-    configured_ollama_base_url = ollama_base_url or os.getenv("MIXAPI_OLLAMA_BASE_URL")
-    configured_ollama_api_key = ollama_api_key or os.getenv("MIXAPI_OLLAMA_API_KEY")
-    provider_adapters: dict[str, Any] = {}
-    if configured_openai_base_url:
-        provider_adapters["provider_openai"] = OpenAICompatibleProviderAdapter(
-            base_url=configured_openai_base_url,
-            api_key=configured_openai_api_key,
-            timeout_seconds=provider_timeout_seconds,
-        )
-    if configured_anthropic_base_url:
-        provider_adapters["provider_anthropic"] = AnthropicProviderAdapter(
-            base_url=configured_anthropic_base_url,
-            api_key=configured_anthropic_api_key,
-            api_version=configured_anthropic_version,
-            timeout_seconds=provider_timeout_seconds,
-        )
-    if configured_gemini_base_url:
-        provider_adapters["provider_gemini"] = GeminiProviderAdapter(
-            base_url=configured_gemini_base_url,
-            api_key=configured_gemini_api_key,
-            timeout_seconds=provider_timeout_seconds,
-        )
-    if configured_ollama_base_url:
-        provider_adapters["provider_ollama"] = OllamaProviderAdapter(
-            base_url=configured_ollama_base_url,
-            api_key=configured_ollama_api_key,
-            timeout_seconds=provider_timeout_seconds,
-        )
     configured_token_quota_limit = token_quota_limit
     if configured_token_quota_limit is None:
         raw_token_quota_limit = os.getenv("MIXAPI_TOKEN_QUOTA_LIMIT")
@@ -213,8 +153,6 @@ def create_app(
     configured_circuit_recovery_seconds = circuit_recovery_seconds or float(
         os.getenv("MIXAPI_CIRCUIT_RECOVERY_SECONDS", "30")
     )
-    configured_database_path = database_path or os.getenv("MIXAPI_DATABASE_PATH")
-    database = SQLiteDatabase(configured_database_path) if configured_database_path else None
     auth_cache = RedisAuthCache(
         redis_runtime.client,
         ttl_seconds=configured_settings.auth_cache_ttl_seconds,
@@ -250,9 +188,7 @@ def create_app(
     )
     adapter_factory = AdapterFactory(
         credential_cipher,
-        deterministic_adapter=deterministic_adapter,
-        connection_overrides=provider_adapters,
-        anthropic_version=configured_anthropic_version,
+        connection_overrides=adapter_overrides,
         retained_versions=configured_settings.snapshot_retention_count,
     )
     configuration_repository = PostgresConfigurationRepository(

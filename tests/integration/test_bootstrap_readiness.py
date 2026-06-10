@@ -7,13 +7,13 @@ import pytest
 import redis
 from fastapi.testclient import TestClient
 
-from mixapi.app import create_app
+from tests.app_factory import create_app
 from mixapi.bootstrap import (
     BootstrapService,
     BootstrapValidationError,
     load_bootstrap_document,
 )
-from mixapi.catalog import default_seed_document
+from mixapi.migration.legacy_catalog import default_seed_document
 from mixapi.postgres import PostgresPool
 from mixapi.publication import ConfigurationPublisher
 from mixapi.repositories.configuration import PostgresConfigurationRepository

@@ -7,7 +7,7 @@ import pytest
 import redis
 
 from mixapi.bootstrap import BootstrapService
-from mixapi.catalog import default_seed_document
+from mixapi.migration.legacy_catalog import default_seed_document
 from mixapi.postgres import PostgresPool
 from mixapi.publication import ConfigurationPublisher
 from mixapi.repositories.configuration import PostgresConfigurationRepository

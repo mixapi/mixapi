@@ -6,9 +6,9 @@ import hashlib
 import math
 from typing import Any
 
-from mixapi.catalog import catalog_from_snapshot
 from mixapi.errors import capability_unsupported, permission_denied, validation_error
 from mixapi.models import LogicalModel, ProviderModel, SchemaSupport
+from mixapi.routing_catalog import catalog_from_snapshot
 from mixapi.snapshots import ConfigurationSnapshot
 
 

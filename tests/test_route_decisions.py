@@ -4,7 +4,7 @@ import os
 import psycopg
 from fastapi.testclient import TestClient
 
-from mixapi.app import create_app
+from tests.app_factory import create_app
 
 
 AUTH_HEADERS = {

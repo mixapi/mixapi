@@ -7,7 +7,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from mixapi.adapters import DeterministicProviderAdapter
-from mixapi.app import create_app
+from tests.app_factory import create_app
 from mixapi.postgres import DependencyUnavailable
 
 

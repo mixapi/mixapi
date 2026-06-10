@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: mixapi_test
+          POSTGRES_USER: mixapi
+          POSTGRES_PASSWORD: mixapi
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mixapi -d mixapi_test"
+          --health-interval 1s
+          --health-timeout 3s
+          --health-retries 30
+      redis:
+        image: redis:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 1s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      MIXAPI_DATABASE_URL: postgresql://mixapi:mixapi@127.0.0.1:5432/mixapi_test
+      MIXAPI_REDIS_URL: redis://127.0.0.1:6379/0
+      MIXAPI_MASTER_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      MIXAPI_MASTER_KEY_VERSION: "1"
+      MIXAPI_ADMIN_KEY: ci-admin-key
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[test]"
+      - run: python scripts/wait_for_dependencies.py
+      - run: python scripts/migrate.py upgrade head
+      - name: Bootstrap test configuration
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from mixapi.migration.legacy_catalog import default_seed_document
+
+          Path("/tmp/mixapi-seed.json").write_text(
+              json.dumps(default_seed_document(credential="ci-provider-secret")),
+              encoding="utf-8",
+          )
+          PY
+          python scripts/bootstrap_configuration.py /tmp/mixapi-seed.json --actor-id ci
+      - run: python -m pytest -v
+      - run: python scripts/generate_openapi.py
+      - run: git diff --exit-code openapi/openapi.json
+      - run: python -m compileall mixapi tests scripts
+      - run: git diff --check
+
