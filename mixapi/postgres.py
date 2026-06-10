@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from typing import Iterator
 
 import psycopg
+from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
 from mixapi.settings import Settings
@@ -21,6 +22,7 @@ class PostgresPool:
             min_size=settings.postgres_pool_min_size,
             max_size=settings.postgres_pool_max_size,
             timeout=settings.dependency_connect_timeout_seconds,
+            kwargs={"row_factory": dict_row},
             open=False,
         )
 

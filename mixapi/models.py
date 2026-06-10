@@ -28,6 +28,9 @@ class ProviderModel:
     pricing: dict[str, Any] = field(default_factory=dict)
     native_features: tuple[str, ...] = ()
     unsupported_parameters: tuple[str, ...] = ()
+    provider_connection_id: str | None = None
+    priority: int = 100
+    weight: int = 1
 
 
 @dataclass(frozen=True)
