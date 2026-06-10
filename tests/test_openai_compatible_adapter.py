@@ -262,7 +262,14 @@ class OpenAICompatibleAdapterTest(unittest.TestCase):
         self.upstream.responses["/v1/chat/completions"] = (
             200,
             {
-                "choices": [{"message": {"role": "assistant", "content": "Invoice found"}}],
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": '{"status":"found"}',
+                        }
+                    }
+                ],
                 "usage": {"prompt_tokens": 8, "completion_tokens": 2},
             },
         )
@@ -309,6 +316,7 @@ class OpenAICompatibleAdapterTest(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["output_text"], '{"status":"found"}')
         upstream_body = self.upstream.requests[0]["body"]
         self.assertEqual(upstream_body["temperature"], 0)
         self.assertEqual(

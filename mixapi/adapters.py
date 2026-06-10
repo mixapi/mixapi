@@ -87,7 +87,10 @@ class DeterministicProviderAdapter:
             )
 
         prompt = extract_text(request_body.get("input", []))
-        output_text = f"[{candidate.provider}:{candidate.provider_model_id}] {prompt}".strip()
+        if _requests_json_schema(request_body):
+            output_text = "{}"
+        else:
+            output_text = f"[{candidate.provider}:{candidate.provider_model_id}] {prompt}".strip()
         return AdapterResponse(
             output_text=output_text,
             input_tokens=count_tokens(prompt),
@@ -1082,6 +1085,14 @@ def extract_text(raw_input: Any) -> str:
                 if isinstance(text, str):
                     chunks.append(text)
     return " ".join(chunks)
+
+
+def _requests_json_schema(request_body: dict[str, Any]) -> bool:
+    response = request_body.get("response")
+    if not isinstance(response, dict):
+        return False
+    response_format = response.get("format")
+    return isinstance(response_format, dict) and response_format.get("type") == "json_schema"
 
 
 def embedding_text(raw_input: Any) -> str:
