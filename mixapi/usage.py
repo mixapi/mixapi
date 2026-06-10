@@ -27,6 +27,8 @@ class UsageEvent:
     cost_usd: Decimal
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     sequence_id: int | None = field(default=None, compare=False, repr=False)
+    provider_connection_id: str | None = None
+    configuration_version: int = 0
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -52,6 +54,19 @@ class UsageQuery:
     end_time: datetime | None = None
     limit: int | None = 50
     after_sequence_id: int = 0
+    after_created_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class UsageWriteIntent:
+    request_id: str
+    tenant_id: str
+    project_id: str
+    api_key_id: str
+    endpoint: str
+    logical_model: str
+    configuration_version: int
+    reservation_data: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -86,15 +101,18 @@ class InMemoryUsageLedger:
 
     def query(self, query: UsageQuery) -> UsagePage:
         with self._lock:
-            matching = [
-                event
-                for event in self._events
-                if event.tenant_id == query.tenant_id
-                and (query.start_time is None or event.created_at >= query.start_time)
-                and (query.end_time is None or event.created_at <= query.end_time)
-                and event.sequence_id is not None
-                and event.sequence_id > query.after_sequence_id
-            ]
+            matching = sorted(
+                [
+                    event
+                    for event in self._events
+                    if event.tenant_id == query.tenant_id
+                    and (query.start_time is None or event.created_at >= query.start_time)
+                    and (query.end_time is None or event.created_at <= query.end_time)
+                    and event.sequence_id is not None
+                    and _after_usage_cursor(event, query)
+                ],
+                key=lambda event: (event.created_at, event.sequence_id or 0),
+            )
         if query.limit is None:
             return UsagePage(events=matching, has_more=False)
         has_more = len(matching) > query.limit
@@ -194,8 +212,9 @@ def build_usage_query(
 
     parsed_limit = _parse_usage_limit(limit)
     after_sequence_id = 0
+    after_created_at = None
     if cursor is not None:
-        after_sequence_id = _decode_usage_cursor(
+        after_created_at, after_sequence_id = _decode_usage_cursor(
             cursor,
             tenant_id=tenant_id,
             start_time=parsed_start,
@@ -208,12 +227,19 @@ def build_usage_query(
         end_time=parsed_end,
         limit=parsed_limit,
         after_sequence_id=after_sequence_id,
+        after_created_at=after_created_at,
     )
 
 
-def encode_usage_cursor(query: UsageQuery, after_sequence_id: int) -> str:
+def encode_usage_cursor(
+    query: UsageQuery,
+    after_sequence_id: int,
+    *,
+    after_created_at: datetime | None = None,
+) -> str:
     payload = {
         "after": after_sequence_id,
+        "after_created_at": _optional_timestamp(after_created_at),
         "end": _optional_timestamp(query.end_time),
         "start": _optional_timestamp(query.start_time),
         "tenant": query.tenant_id,
@@ -249,11 +275,13 @@ def _decode_usage_cursor(
     tenant_id: str,
     start_time: datetime | None,
     end_time: datetime | None,
-) -> int:
+) -> tuple[datetime | None, int]:
     try:
         padding = "=" * (-len(cursor) % 4)
         payload = json.loads(base64.urlsafe_b64decode(cursor + padding))
         after_sequence_id = payload["after"]
+        raw_after_created_at = payload.get("after_created_at")
+        after_created_at = parse_usage_timestamp(raw_after_created_at)
         valid = (
             payload.get("v") == 1
             and payload.get("tenant") == tenant_id
@@ -262,17 +290,28 @@ def _decode_usage_cursor(
             and isinstance(after_sequence_id, int)
             and not isinstance(after_sequence_id, bool)
             and after_sequence_id > 0
+            and after_created_at is not None
         )
     except (binascii.Error, KeyError, TypeError, ValueError, json.JSONDecodeError):
         valid = False
         after_sequence_id = 0
+        after_created_at = None
     if not valid:
         raise UsageQueryValidationError(
             "invalid_usage_cursor",
             "The usage cursor is invalid for this tenant or time window.",
         )
-    return after_sequence_id
+    return after_created_at, after_sequence_id
 
 
 def _optional_timestamp(value: datetime | None) -> str | None:
     return format_usage_timestamp(value) if value is not None else None
+
+
+def _after_usage_cursor(event: UsageEvent, query: UsageQuery) -> bool:
+    if query.after_created_at is None:
+        return event.sequence_id is not None and event.sequence_id > query.after_sequence_id
+    return (event.created_at, event.sequence_id or 0) > (
+        query.after_created_at,
+        query.after_sequence_id,
+    )

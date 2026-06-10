@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 
+import psycopg
 import pytest
 
 
@@ -29,3 +30,15 @@ def redis_url() -> str:
     value = os.getenv("MIXAPI_REDIS_URL")
     assert value, "MIXAPI_REDIS_URL is required for the test suite"
     return value
+
+
+@pytest.fixture(autouse=True)
+def reset_postgres_accounting(database_url: str) -> None:
+    with psycopg.connect(database_url) as connection:
+        connection.execute(
+            """
+            TRUNCATE usage_events, route_decisions, budget_spend,
+                     usage_write_intents, budget_reconciliation_outbox
+            RESTART IDENTITY CASCADE
+            """
+        )

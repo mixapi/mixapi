@@ -1,6 +1,7 @@
 import unittest
 import os
 
+import psycopg
 from fastapi.testclient import TestClient
 
 from mixapi.app import create_app
@@ -13,9 +14,22 @@ AUTH_HEADERS = {
 
 
 class RouteDecisionsTest(unittest.TestCase):
+    def setUp(self) -> None:
+        with psycopg.connect(os.environ["MIXAPI_DATABASE_URL"]) as connection:
+            connection.execute(
+                """
+                TRUNCATE usage_events, route_decisions, budget_spend,
+                         usage_write_intents, budget_reconciliation_outbox
+                RESTART IDENTITY CASCADE
+                """
+            )
+
+    def _client(self, app=None) -> TestClient:
+        return self.enterContext(TestClient(app or create_app()))
+
     def test_route_decision_is_persisted_and_readable(self) -> None:
         app = create_app(failed_response_providers={"ollama"})
-        client = TestClient(app)
+        client = self._client(app)
 
         response = client.post(
             "/v1/responses",
@@ -42,7 +56,7 @@ class RouteDecisionsTest(unittest.TestCase):
         self.assertTrue(route["fallback_used"])
 
     def test_missing_route_decision_returns_normalized_not_found(self) -> None:
-        client = TestClient(create_app())
+        client = self._client()
 
         response = client.get("/v1/route-decisions/req_missing", headers=AUTH_HEADERS)
 
@@ -56,7 +70,7 @@ class RouteDecisionsTest(unittest.TestCase):
         os.environ["MIXAPI_API_KEYS"] = "other-tenant-key"
         try:
             app = create_app()
-            client = TestClient(app)
+            client = self._client(app)
             create_response = client.post(
                 "/v1/responses",
                 headers=AUTH_HEADERS,

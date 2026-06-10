@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import uuid4
 
 from mixapi.auth import Principal
@@ -27,6 +27,14 @@ class BudgetService(Protocol):
     ) -> BudgetReservation: ...
 
     def reconcile(self, reservation: BudgetReservation, actual_cost_usd: Decimal) -> None: ...
+
+    def reconcile_with_usage(
+        self,
+        reservation: BudgetReservation,
+        actual_cost_usd: Decimal,
+        usage_ledger: Any,
+        events: list[Any],
+    ) -> list[Any]: ...
 
     def release(self, reservation: BudgetReservation) -> None: ...
 
@@ -77,6 +85,16 @@ class InMemoryBudgetService:
         if not reservation.tracked:
             return
         self._reserved_spend[reservation.api_key_id] -= reservation.amount_usd
+
+    def reconcile_with_usage(
+        self,
+        reservation: BudgetReservation,
+        actual_cost_usd: Decimal,
+        usage_ledger: Any,
+        events: list[Any],
+    ) -> list[Any]:
+        self.reconcile(reservation, actual_cost_usd)
+        return [usage_ledger.record(event) for event in events]
 
 
 def effective_budget_limit(

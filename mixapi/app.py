@@ -38,7 +38,7 @@ from mixapi.auth import (
     require_scope,
 )
 from mixapi.auth_cache import RedisAuthCache
-from mixapi.budget import BudgetService, InMemoryBudgetService
+from mixapi.budget import BudgetService
 from mixapi.catalog import default_catalog
 from mixapi.circuits import CircuitBreaker, InMemoryCircuitBreaker
 from mixapi.errors import (
@@ -56,17 +56,17 @@ from mixapi.models import ProviderModel
 from mixapi.observability import InMemoryObservability, Observability, SafeObservability
 from mixapi.postgres import PostgresPool
 from mixapi.persistence import (
-    SQLiteBudgetService,
     SQLiteCircuitBreaker,
     SQLiteDatabase,
     SQLiteIdempotencyStore,
-    SQLiteRouteDecisionStore,
-    SQLiteUsageLedger,
 )
 from mixapi.quota import InMemoryQuotaService, QuotaService, TokenReservation
 from mixapi.redis_runtime import RedisRuntime
+from mixapi.repositories.budgets import PostgresBudgetService
 from mixapi.repositories.control_plane import PostgresControlPlaneStore
-from mixapi.route_decisions import InMemoryRouteDecisionStore, RouteDecisionRecord
+from mixapi.repositories.route_decisions import PostgresRouteDecisionStore
+from mixapi.repositories.usage import PostgresUsageLedger
+from mixapi.route_decisions import RouteDecisionRecord
 from mixapi.routing import plan_route
 from mixapi.streaming import encode_sse
 from mixapi.structured_output import (
@@ -78,9 +78,9 @@ from mixapi.structured_output import (
 )
 from mixapi.settings import Settings
 from mixapi.usage import (
-    InMemoryUsageLedger,
     UsageEvent,
     UsageQueryValidationError,
+    UsageWriteIntent,
     build_usage_query,
     encode_usage_cursor,
     usage_csv,
@@ -203,11 +203,7 @@ def create_app(
     configured_admin_api_key = admin_api_key or configured_settings.admin_api_key
     authenticate_admin = build_admin_authenticator(configured_admin_api_key)
     authenticate_service = build_service_authenticator(control_plane, auth_cache)
-    budget = (
-        SQLiteBudgetService(database, limit_usd=budget_limit)
-        if database
-        else InMemoryBudgetService(limit_usd=budget_limit)
-    )
+    budget = PostgresBudgetService(postgres_pool, limit_usd=budget_limit)
     circuits = (
         SQLiteCircuitBreaker(
             database,
@@ -220,11 +216,9 @@ def create_app(
             recovery_timeout_seconds=configured_circuit_recovery_seconds,
         )
     )
-    usage_ledger = SQLiteUsageLedger(database) if database else InMemoryUsageLedger()
+    usage_ledger = PostgresUsageLedger(postgres_pool)
     idempotency_store = SQLiteIdempotencyStore(database) if database else InMemoryIdempotencyStore()
-    route_decision_store = (
-        SQLiteRouteDecisionStore(database) if database else InMemoryRouteDecisionStore()
-    )
+    route_decision_store = PostgresRouteDecisionStore(postgres_pool)
     if observability is None:
         observability = InMemoryObservability()
     instrumentation = SafeObservability(observability)
@@ -329,6 +323,21 @@ def create_app(
         except MixAPIError:
             budget.release(reservation)
             raise
+        try:
+            usage_ledger.begin_intent(
+                _usage_write_intent(
+                    request_id=request.state.request_id,
+                    principal=principal,
+                    endpoint="responses",
+                    logical_model=request_body["model"],
+                    reservation=reservation,
+                    token_reservation=token_reservation,
+                )
+            )
+        except Exception:
+            budget.release(reservation)
+            quota.release_tokens(token_reservation)
+            raise
         if request_body.get("stream", False):
             try:
                 provider_stream, selected_candidate, failed_attempts = (
@@ -351,6 +360,7 @@ def create_app(
                 )
                 budget.release(reservation)
                 quota.release_tokens(token_reservation)
+                usage_ledger.fail_intent(request.state.request_id)
                 route_decision_store.record(
                     RouteDecisionRecord(
                         request_id=request.state.request_id,
@@ -422,21 +432,27 @@ def create_app(
                 input_tokens, output_tokens, cost = _billable_dispatch_totals(
                     error.billable_dispatches
                 )
-                budget.reconcile(reservation, cost)
-                quota.reconcile_tokens(
-                    token_reservation,
-                    input_tokens + output_tokens,
-                )
-                _record_billable_response_usage(
-                    usage_ledger=usage_ledger,
+                usage_events = _billable_response_usage_events(
                     dispatches=error.billable_dispatches,
                     request_id=request.state.request_id,
                     principal=principal,
                     logical_model=request_body["model"],
                 )
+                _settle_accounting(
+                    budget,
+                    reservation,
+                    cost,
+                    usage_ledger,
+                    usage_events,
+                )
+                quota.reconcile_tokens(
+                    token_reservation,
+                    input_tokens + output_tokens,
+                )
             else:
                 budget.release(reservation)
                 quota.release_tokens(token_reservation)
+                usage_ledger.fail_intent(request.state.request_id)
             route_decision_store.record(
                 RouteDecisionRecord(
                     request_id=request.state.request_id,
@@ -473,17 +489,22 @@ def create_app(
         input_tokens, output_tokens, cost = _billable_dispatch_totals(
             outcome.billable_dispatches
         )
-        budget.reconcile(reservation, cost)
-        quota.reconcile_tokens(
-            token_reservation,
-            input_tokens + output_tokens,
-        )
-        _record_billable_response_usage(
-            usage_ledger=usage_ledger,
+        usage_events = _billable_response_usage_events(
             dispatches=outcome.billable_dispatches,
             request_id=request.state.request_id,
             principal=principal,
             logical_model=request_body["model"],
+        )
+        _settle_accounting(
+            budget,
+            reservation,
+            cost,
+            usage_ledger,
+            usage_events,
+        )
+        quota.reconcile_tokens(
+            token_reservation,
+            input_tokens + output_tokens,
         )
         attempts = _route_attempts(
             failed_attempts=failed_attempts,
@@ -601,6 +622,21 @@ def create_app(
             budget.release(reservation)
             raise
         try:
+            usage_ledger.begin_intent(
+                _usage_write_intent(
+                    request_id=request.state.request_id,
+                    principal=principal,
+                    endpoint="embeddings",
+                    logical_model=request_body["model"],
+                    reservation=reservation,
+                    token_reservation=token_reservation,
+                )
+            )
+        except Exception:
+            budget.release(reservation)
+            quota.release_tokens(token_reservation)
+            raise
+        try:
             adapter_response, selected_candidate, failed_attempts = _dispatch_embedding_with_fallback(
                 adapter=adapter,
                 request_body=request_body,
@@ -619,6 +655,7 @@ def create_app(
             )
             budget.release(reservation)
             quota.release_tokens(token_reservation)
+            usage_ledger.fail_intent(request.state.request_id)
             route_decision_store.record(
                 RouteDecisionRecord(
                     request_id=request.state.request_id,
@@ -651,23 +688,28 @@ def create_app(
             input_price=selected_candidate.pricing.get("input_per_million", "0"),
             output_price="0",
         )
-        budget.reconcile(reservation, cost)
-        quota.reconcile_tokens(token_reservation, adapter_response.input_tokens)
-        usage_ledger.record(
-            UsageEvent(
-                request_id=request.state.request_id,
-                tenant_id=principal.tenant_id,
-                project_id=principal.project_id,
-                api_key_id=principal.api_key_id,
-                endpoint="embeddings",
-                logical_model=request_body["model"],
-                provider=selected_candidate.provider,
-                provider_model=selected_candidate.provider_model_id,
-                input_tokens=adapter_response.input_tokens,
-                output_tokens=0,
-                cost_usd=cost,
-            )
+        usage_event = UsageEvent(
+            request_id=request.state.request_id,
+            tenant_id=principal.tenant_id,
+            project_id=principal.project_id,
+            api_key_id=principal.api_key_id,
+            endpoint="embeddings",
+            logical_model=request_body["model"],
+            provider=selected_candidate.provider,
+            provider_model=selected_candidate.provider_model_id,
+            input_tokens=adapter_response.input_tokens,
+            output_tokens=0,
+            cost_usd=cost,
+            provider_connection_id=selected_candidate.provider_connection_id,
         )
+        _settle_accounting(
+            budget,
+            reservation,
+            cost,
+            usage_ledger,
+            [usage_event],
+        )
+        quota.reconcile_tokens(token_reservation, adapter_response.input_tokens)
         attempts = _route_attempts(
             failed_attempts=failed_attempts,
             selected_provider=selected_candidate.provider,
@@ -752,7 +794,11 @@ def create_app(
         page = usage_ledger.query(query)
         next_cursor = None
         if page.has_more and page.events:
-            next_cursor = encode_usage_cursor(query, page.events[-1].sequence_id or 0)
+            next_cursor = encode_usage_cursor(
+                query,
+                page.events[-1].sequence_id or 0,
+                after_created_at=page.events[-1].created_at,
+            )
         return usage_response(
             page.events,
             has_more=page.has_more,
@@ -1434,7 +1480,22 @@ def _native_response_event_stream(
         input_price=selected_candidate.pricing.get("input_per_million", "0"),
         output_price=selected_candidate.pricing.get("output_per_million", "0"),
     )
-    budget.reconcile(reservation, cost)
+    usage_event = _response_usage_event(
+        request_id=request_id,
+        principal=principal,
+        request_body=request_body,
+        selected_candidate=selected_candidate,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cost=cost,
+    )
+    _settle_accounting(
+        budget,
+        reservation,
+        cost,
+        usage_ledger,
+        [usage_event],
+    )
     quota.reconcile_tokens(token_reservation, input_tokens + output_tokens)
     circuits.record_success(selected_candidate.provider, selected_candidate.provider_model_id)
     _record_circuit_state(
@@ -1443,17 +1504,6 @@ def _native_response_event_stream(
         trace_id,
         selected_candidate.provider,
         selected_candidate.provider_model_id,
-    )
-    usage_ledger.record(
-        _response_usage_event(
-            request_id=request_id,
-            principal=principal,
-            request_body=request_body,
-            selected_candidate=selected_candidate,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            cost=cost,
-        )
     )
     attempts = _route_attempts(
         failed_attempts=failed_attempts,
@@ -1516,7 +1566,22 @@ def _finalize_interrupted_stream(
         input_price=selected_candidate.pricing.get("input_per_million", "0"),
         output_price=selected_candidate.pricing.get("output_per_million", "0"),
     )
-    budget.reconcile(reservation, cost)
+    usage_event = _response_usage_event(
+        request_id=request_id,
+        principal=principal,
+        request_body=request_body,
+        selected_candidate=selected_candidate,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cost=cost,
+    )
+    _settle_accounting(
+        budget,
+        reservation,
+        cost,
+        usage_ledger,
+        [usage_event],
+    )
     quota.reconcile_tokens(token_reservation, input_tokens + output_tokens)
     circuits.record_failure(
         selected_candidate.provider,
@@ -1547,17 +1612,6 @@ def _finalize_interrupted_stream(
                 "error_class": reason,
             },
         )
-    usage_ledger.record(
-        _response_usage_event(
-            request_id=request_id,
-            principal=principal,
-            request_body=request_body,
-            selected_candidate=selected_candidate,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            cost=cost,
-        )
-    )
     attempts = [
         *failed_attempts,
         {
@@ -1604,6 +1658,7 @@ def _response_usage_event(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cost_usd=cost,
+        provider_connection_id=selected_candidate.provider_connection_id,
     )
 
 
@@ -1627,34 +1682,73 @@ def _billable_dispatch_totals(
     return input_tokens, output_tokens, cost
 
 
-def _record_billable_response_usage(
-    usage_ledger: Any,
+def _billable_response_usage_events(
     dispatches: list[BillableDispatch] | tuple[BillableDispatch, ...],
     request_id: str,
     principal: Principal,
     logical_model: str,
-) -> None:
-    for dispatch in dispatches:
-        usage_ledger.record(
-            UsageEvent(
-                request_id=request_id,
-                tenant_id=principal.tenant_id,
-                project_id=principal.project_id,
-                api_key_id=principal.api_key_id,
-                endpoint="responses",
-                logical_model=logical_model,
-                provider=dispatch.candidate.provider,
-                provider_model=dispatch.candidate.provider_model_id,
+) -> list[UsageEvent]:
+    return [
+        UsageEvent(
+            request_id=request_id,
+            tenant_id=principal.tenant_id,
+            project_id=principal.project_id,
+            api_key_id=principal.api_key_id,
+            endpoint="responses",
+            logical_model=logical_model,
+            provider=dispatch.candidate.provider,
+            provider_model=dispatch.candidate.provider_model_id,
+            input_tokens=dispatch.response.input_tokens,
+            output_tokens=dispatch.response.output_tokens,
+            cost_usd=_estimate_cost(
                 input_tokens=dispatch.response.input_tokens,
                 output_tokens=dispatch.response.output_tokens,
-                cost_usd=_estimate_cost(
-                    input_tokens=dispatch.response.input_tokens,
-                    output_tokens=dispatch.response.output_tokens,
-                    input_price=dispatch.candidate.pricing.get("input_per_million", "0"),
-                    output_price=dispatch.candidate.pricing.get("output_per_million", "0"),
-                ),
-            )
+                input_price=dispatch.candidate.pricing.get("input_per_million", "0"),
+                output_price=dispatch.candidate.pricing.get("output_per_million", "0"),
+            ),
+            provider_connection_id=dispatch.candidate.provider_connection_id,
         )
+        for dispatch in dispatches
+    ]
+
+
+def _settle_accounting(
+    budget: BudgetService,
+    reservation: Any,
+    actual_cost_usd: Decimal,
+    usage_ledger: Any,
+    events: list[UsageEvent],
+) -> None:
+    budget.reconcile_with_usage(
+        reservation,
+        actual_cost_usd,
+        usage_ledger,
+        events,
+    )
+
+
+def _usage_write_intent(
+    *,
+    request_id: str,
+    principal: Principal,
+    endpoint: str,
+    logical_model: str,
+    reservation: Any,
+    token_reservation: TokenReservation,
+) -> UsageWriteIntent:
+    return UsageWriteIntent(
+        request_id=request_id,
+        tenant_id=principal.tenant_id,
+        project_id=principal.project_id,
+        api_key_id=principal.api_key_id,
+        endpoint=endpoint,
+        logical_model=logical_model,
+        configuration_version=0,
+        reservation_data={
+            "budget_reservation_id": reservation.reservation_id,
+            "token_reservation_id": token_reservation.reservation_id,
+        },
+    )
 
 
 def _response_payload(

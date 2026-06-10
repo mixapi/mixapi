@@ -6,6 +6,7 @@ import unittest
 from datetime import datetime, timezone
 from decimal import Decimal
 
+import psycopg
 from fastapi.testclient import TestClient
 
 from mixapi.app import create_app
@@ -16,9 +17,22 @@ DEV_HEADERS = {"Authorization": "Bearer dev-key"}
 
 
 class UsageEndpointTest(unittest.TestCase):
+    def setUp(self) -> None:
+        with psycopg.connect(os.environ["MIXAPI_DATABASE_URL"]) as connection:
+            connection.execute(
+                """
+                TRUNCATE usage_events, route_decisions, budget_spend,
+                         usage_write_intents, budget_reconciliation_outbox
+                RESTART IDENTITY CASCADE
+                """
+            )
+
+    def _client(self, app=None) -> TestClient:
+        return self.enterContext(TestClient(app or create_app()))
+
     def test_usage_events_include_utc_creation_time(self) -> None:
         app = create_app()
-        client = TestClient(app)
+        client = self._client(app)
 
         client.post(
             "/v1/responses",
@@ -35,7 +49,7 @@ class UsageEndpointTest(unittest.TestCase):
 
     def test_usage_endpoint_filters_by_inclusive_time_window(self) -> None:
         app = create_app()
-        client = TestClient(app)
+        client = self._client(app)
         for request_id, created_at in (
             ("req_before", datetime(2026, 6, 9, 9, 59, tzinfo=timezone.utc)),
             ("req_start", datetime(2026, 6, 9, 10, 0, tzinfo=timezone.utc)),
@@ -61,7 +75,7 @@ class UsageEndpointTest(unittest.TestCase):
 
     def test_usage_endpoint_paginates_without_duplicates(self) -> None:
         app = create_app()
-        client = TestClient(app)
+        client = self._client(app)
         for index in range(3):
             app.state.usage_ledger.record(
                 _usage_event(
@@ -94,7 +108,7 @@ class UsageEndpointTest(unittest.TestCase):
         self.assertIsNone(second.json()["next_cursor"])
 
     def test_usage_endpoint_rejects_invalid_limit(self) -> None:
-        client = TestClient(create_app())
+        client = self._client()
 
         response = client.get("/v1/usage", headers=DEV_HEADERS, params={"limit": 0})
 
@@ -102,7 +116,7 @@ class UsageEndpointTest(unittest.TestCase):
         self.assertEqual(response.json()["error"]["code"], "invalid_usage_limit")
 
     def test_usage_endpoint_rejects_invalid_timestamp(self) -> None:
-        client = TestClient(create_app())
+        client = self._client()
 
         response = client.get(
             "/v1/usage",
@@ -114,7 +128,7 @@ class UsageEndpointTest(unittest.TestCase):
         self.assertEqual(response.json()["error"]["code"], "invalid_usage_timestamp")
 
     def test_usage_endpoint_rejects_reversed_time_window(self) -> None:
-        client = TestClient(create_app())
+        client = self._client()
 
         response = client.get(
             "/v1/usage",
@@ -130,13 +144,13 @@ class UsageEndpointTest(unittest.TestCase):
 
     def test_usage_cursor_is_bound_to_time_window(self) -> None:
         app = create_app()
+        client = self._client(app)
         app.state.usage_ledger.record(
             _usage_event("req_cursor", datetime(2026, 6, 9, 10, 0, tzinfo=timezone.utc))
         )
         app.state.usage_ledger.record(
             _usage_event("req_cursor_2", datetime(2026, 6, 9, 10, 1, tzinfo=timezone.utc))
         )
-        client = TestClient(app)
         first = client.get(
             "/v1/usage",
             headers=DEV_HEADERS,
@@ -157,7 +171,7 @@ class UsageEndpointTest(unittest.TestCase):
         self.assertEqual(response.json()["error"]["code"], "invalid_usage_cursor")
 
     def test_usage_endpoint_rejects_malformed_cursor(self) -> None:
-        client = TestClient(create_app())
+        client = self._client()
 
         response = client.get(
             "/v1/usage",
@@ -170,7 +184,7 @@ class UsageEndpointTest(unittest.TestCase):
 
     def test_usage_endpoint_lists_events_and_aggregate_totals(self) -> None:
         app = create_app()
-        client = TestClient(app)
+        client = self._client(app)
 
         client.post(
             "/v1/responses",
@@ -212,7 +226,7 @@ class UsageEndpointTest(unittest.TestCase):
         os.environ["MIXAPI_API_KEYS"] = "other-usage-key"
         try:
             app = create_app()
-            client = TestClient(app)
+            client = self._client(app)
             client.post(
                 "/v1/responses",
                 headers=DEV_HEADERS,
@@ -247,7 +261,7 @@ class UsageEndpointTest(unittest.TestCase):
         os.environ["MIXAPI_API_KEYS"] = "other-export-key"
         try:
             app = create_app()
-            client = TestClient(app)
+            client = self._client(app)
             client.post(
                 "/v1/responses",
                 headers=DEV_HEADERS,
@@ -280,13 +294,13 @@ class UsageEndpointTest(unittest.TestCase):
 
     def test_usage_csv_export_honors_time_window(self) -> None:
         app = create_app()
+        client = self._client(app)
         app.state.usage_ledger.record(
             _usage_event("req_csv_before", datetime(2026, 6, 9, 9, 59, tzinfo=timezone.utc))
         )
         app.state.usage_ledger.record(
             _usage_event("req_csv_inside", datetime(2026, 6, 9, 10, 0, tzinfo=timezone.utc))
         )
-        client = TestClient(app)
 
         response = client.get(
             "/v1/usage/export",
@@ -304,6 +318,7 @@ class UsageEndpointTest(unittest.TestCase):
 
     def test_usage_export_returns_filtered_tenant_scoped_jsonl(self) -> None:
         app = create_app()
+        client = self._client(app)
         app.state.usage_ledger.record(
             _usage_event("req_jsonl_before", datetime(2026, 6, 9, 9, 59, tzinfo=timezone.utc))
         )
@@ -317,7 +332,6 @@ class UsageEndpointTest(unittest.TestCase):
                 tenant_id="tenant_other",
             )
         )
-        client = TestClient(app)
 
         response = client.get(
             "/v1/usage/export",
@@ -340,7 +354,7 @@ class UsageEndpointTest(unittest.TestCase):
 
     def test_usage_export_rejects_unsupported_format(self) -> None:
         app = create_app()
-        client = TestClient(app)
+        client = self._client(app)
 
         response = client.get("/v1/usage/export?format=xml", headers=DEV_HEADERS)
 

@@ -18,6 +18,8 @@ class RouteDecisionRecord:
     selected_provider_model: str | None
     attempts: tuple[dict[str, str], ...]
     rejected_candidates: tuple[dict[str, str], ...]
+    selected_provider_connection_id: str | None = None
+    configuration_version: int = 0
 
     def public_dict(self) -> dict[str, Any]:
         return {
