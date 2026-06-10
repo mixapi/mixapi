@@ -7,14 +7,12 @@ from fastapi.testclient import TestClient
 from mixapi.adapters import ProviderStream, ProviderStreamEvent
 from mixapi.app import _native_response_event_stream, create_app
 from mixapi.auth import Principal
-from mixapi.budget import InMemoryBudgetService
 from mixapi.catalog import default_catalog
-from mixapi.circuits import InMemoryCircuitBreaker
 from mixapi.observability import InMemoryObservability
-from mixapi.quota import InMemoryQuotaService
 from mixapi.route_decisions import InMemoryRouteDecisionStore
 from mixapi.streaming import _text_deltas
 from mixapi.usage import InMemoryUsageLedger
+from tests.runtime_fakes import FakeBudgetService, FakeCircuitBreaker, FakeQuotaService
 
 
 AUTH_HEADERS = {"Authorization": "Bearer dev-key", "X-Request-ID": "req_stream_1"}
@@ -107,9 +105,9 @@ class StreamingTest(unittest.TestCase):
             candidate=candidate,
         )
         principal = Principal("tenant", "project", "key", ("responses:create",))
-        budget = InMemoryBudgetService(limit_usd=Decimal("10"))
+        budget = FakeBudgetService(limit_usd=Decimal("10"))
         reservation = budget.reserve(principal, Decimal("1"))
-        quota = InMemoryQuotaService(token_limit=10)
+        quota = FakeQuotaService(token_limit=10)
         token_reservation = quota.reserve_tokens(principal, 8)
         usage = InMemoryUsageLedger()
         routes = InMemoryRouteDecisionStore()
@@ -125,7 +123,7 @@ class StreamingTest(unittest.TestCase):
             budget=budget,
             quota=quota,
             token_reservation=token_reservation,
-            circuits=InMemoryCircuitBreaker(),
+            circuits=FakeCircuitBreaker(),
             usage_ledger=usage,
             route_decision_store=routes,
             observability=InMemoryObservability(),

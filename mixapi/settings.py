@@ -23,6 +23,8 @@ class Settings:
     dependency_connect_timeout_seconds: float = 5.0
     redis_socket_timeout_seconds: float = 2.0
     auth_cache_ttl_seconds: int = 60
+    redis_namespace: str = "mixapi"
+    idempotency_ttl_seconds: int = 86_400
 
     def __post_init__(self) -> None:
         if not self.database_url.strip():
@@ -47,6 +49,10 @@ class Settings:
             raise ConfigurationError("Redis socket timeout must be positive")
         if self.auth_cache_ttl_seconds <= 0:
             raise ConfigurationError("Auth cache TTL must be positive")
+        if not self.redis_namespace or ":" in self.redis_namespace:
+            raise ConfigurationError("Redis namespace must be non-empty and cannot contain ':'")
+        if self.idempotency_ttl_seconds <= 0:
+            raise ConfigurationError("Idempotency TTL must be positive")
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -77,6 +83,11 @@ class Settings:
                 2.0,
             ),
             auth_cache_ttl_seconds=_env_positive_int("MIXAPI_AUTH_CACHE_TTL_SECONDS", 60),
+            redis_namespace=os.getenv("MIXAPI_REDIS_NAMESPACE", "mixapi").strip(),
+            idempotency_ttl_seconds=_env_positive_int(
+                "MIXAPI_IDEMPOTENCY_TTL_SECONDS",
+                86_400,
+            ),
         )
 
 

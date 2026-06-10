@@ -40,7 +40,7 @@ from mixapi.auth import (
 from mixapi.auth_cache import RedisAuthCache
 from mixapi.budget import BudgetService
 from mixapi.catalog import default_catalog
-from mixapi.circuits import CircuitBreaker, InMemoryCircuitBreaker
+from mixapi.circuits import CircuitBreaker
 from mixapi.errors import (
     MixAPIError,
     budget_exceeded,
@@ -51,21 +51,22 @@ from mixapi.errors import (
     upstream_timeout,
     validation_error,
 )
-from mixapi.idempotency import InMemoryIdempotencyStore
 from mixapi.models import ProviderModel
 from mixapi.observability import InMemoryObservability, Observability, SafeObservability
 from mixapi.postgres import PostgresPool
 from mixapi.persistence import (
-    SQLiteCircuitBreaker,
     SQLiteDatabase,
-    SQLiteIdempotencyStore,
 )
-from mixapi.quota import InMemoryQuotaService, QuotaService, TokenReservation
+from mixapi.quota import QuotaService, TokenReservation
 from mixapi.redis_runtime import RedisRuntime
 from mixapi.repositories.budgets import PostgresBudgetService
 from mixapi.repositories.control_plane import PostgresControlPlaneStore
 from mixapi.repositories.route_decisions import PostgresRouteDecisionStore
 from mixapi.repositories.usage import PostgresUsageLedger
+from mixapi.runtime.budget import RedisBudgetService
+from mixapi.runtime.circuits import RedisCircuitBreaker
+from mixapi.runtime.idempotency import RedisIdempotencyStore
+from mixapi.runtime.quota import RedisQuotaService
 from mixapi.route_decisions import RouteDecisionRecord
 from mixapi.routing import plan_route
 from mixapi.streaming import encode_sse
@@ -181,7 +182,9 @@ def create_app(
         raw_token_quota_limit = os.getenv("MIXAPI_TOKEN_QUOTA_LIMIT")
         if raw_token_quota_limit is not None:
             configured_token_quota_limit = int(raw_token_quota_limit)
-    quota = InMemoryQuotaService(
+    quota = RedisQuotaService(
+        redis_runtime.client,
+        namespace=configured_settings.redis_namespace,
         request_limit=request_quota_limit,
         token_limit=configured_token_quota_limit,
     )
@@ -203,21 +206,25 @@ def create_app(
     configured_admin_api_key = admin_api_key or configured_settings.admin_api_key
     authenticate_admin = build_admin_authenticator(configured_admin_api_key)
     authenticate_service = build_service_authenticator(control_plane, auth_cache)
-    budget = PostgresBudgetService(postgres_pool, limit_usd=budget_limit)
-    circuits = (
-        SQLiteCircuitBreaker(
-            database,
-            failure_threshold=configured_circuit_failure_threshold,
-            recovery_timeout_seconds=configured_circuit_recovery_seconds,
-        )
-        if database
-        else InMemoryCircuitBreaker(
-            failure_threshold=configured_circuit_failure_threshold,
-            recovery_timeout_seconds=configured_circuit_recovery_seconds,
-        )
+    durable_budget = PostgresBudgetService(postgres_pool)
+    budget = RedisBudgetService(
+        redis_runtime.client,
+        durable_budget,
+        namespace=configured_settings.redis_namespace,
+        limit_usd=budget_limit,
+    )
+    circuits = RedisCircuitBreaker(
+        redis_runtime.client,
+        namespace=configured_settings.redis_namespace,
+        failure_threshold=configured_circuit_failure_threshold,
+        recovery_timeout_seconds=configured_circuit_recovery_seconds,
     )
     usage_ledger = PostgresUsageLedger(postgres_pool)
-    idempotency_store = SQLiteIdempotencyStore(database) if database else InMemoryIdempotencyStore()
+    idempotency_store = RedisIdempotencyStore(
+        redis_runtime.client,
+        namespace=configured_settings.redis_namespace,
+        ttl_seconds=configured_settings.idempotency_ttl_seconds,
+    )
     route_decision_store = PostgresRouteDecisionStore(postgres_pool)
     if observability is None:
         observability = InMemoryObservability()

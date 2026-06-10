@@ -4,6 +4,7 @@ import os
 
 import psycopg
 import pytest
+import redis
 
 
 os.environ.setdefault(
@@ -33,7 +34,7 @@ def redis_url() -> str:
 
 
 @pytest.fixture(autouse=True)
-def reset_postgres_accounting(database_url: str) -> None:
+def reset_runtime_state(database_url: str, redis_url: str) -> None:
     with psycopg.connect(database_url) as connection:
         connection.execute(
             """
@@ -42,3 +43,6 @@ def reset_postgres_accounting(database_url: str) -> None:
             RESTART IDENTITY CASCADE
             """
         )
+    client = redis.Redis.from_url(redis_url)
+    client.flushdb()
+    client.close()

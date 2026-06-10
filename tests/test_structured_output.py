@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 
 from mixapi.adapters import AdapterResponse, DeterministicProviderAdapter
 from mixapi.app import create_app
-from mixapi.circuits import InMemoryCircuitBreaker
+from mixapi.runtime.circuits import RedisCircuitBreaker
 from mixapi.structured_output import (
     InvalidResponseSchema,
     ValidationFailure,
@@ -213,7 +213,7 @@ class StructuredOutputEndpointTest(unittest.TestCase):
                 side_effect=dispatch,
             ) as provider_dispatch,
             patch.object(
-                InMemoryCircuitBreaker,
+                RedisCircuitBreaker,
                 "record_failure",
                 autospec=True,
             ) as record_failure,

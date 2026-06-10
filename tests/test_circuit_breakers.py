@@ -4,7 +4,7 @@ import unittest
 from fastapi.testclient import TestClient
 
 from mixapi.app import create_app
-from mixapi.circuits import InMemoryCircuitBreaker
+from tests.runtime_fakes import FakeCircuitBreaker
 
 
 AUTH_HEADERS = {"Authorization": "Bearer dev-key"}
@@ -13,7 +13,7 @@ AUTH_HEADERS = {"Authorization": "Bearer dev-key"}
 class CircuitBreakerTest(unittest.TestCase):
     def test_open_circuit_allows_requests_after_recovery_timeout(self) -> None:
         current_time = [100.0]
-        circuits = InMemoryCircuitBreaker(
+        circuits = FakeCircuitBreaker(
             failure_threshold=1,
             recovery_timeout_seconds=10,
             now=lambda: current_time[0],

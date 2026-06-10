@@ -153,6 +153,17 @@ class PostgresBudgetService:
                 (api_key_id, amount_usd),
             )
 
+    def mark_reconciliation_processed(self, reservation_id: str) -> None:
+        with self._pool.connection() as connection:
+            connection.execute(
+                """
+                UPDATE budget_reconciliation_outbox
+                SET processed_at = now(), claim_expires_at = NULL
+                WHERE reservation_id = %s AND processed_at IS NULL
+                """,
+                (reservation_id,),
+            )
+
 
 def _budget_intent_id(reservation_id: str) -> str:
     return f"budget_{reservation_id}"
