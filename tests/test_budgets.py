@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from mixapi.adapters import DeterministicProviderAdapter
+from mixapi.adapters import AdapterResponse, DeterministicProviderAdapter
 from mixapi.app import create_app
 
 
@@ -84,6 +84,7 @@ class BudgetTest(unittest.TestCase):
             DeterministicProviderAdapter,
             "dispatch_response",
             autospec=True,
+            return_value=AdapterResponse("{}", 1, 1),
         ) as dispatch:
             response = client.post(
                 "/v1/responses",
@@ -92,7 +93,7 @@ class BudgetTest(unittest.TestCase):
                     "model": "mixapi/balanced-chat",
                     "input": "Return JSON",
                     "max_output_tokens": 8,
-                    "routing": {"max_cost_usd": "0.00002000"},
+                    "routing": {"max_cost_usd": "0.00005000"},
                     "native": {"provider": "openai"},
                     "response": {
                         "format": {
@@ -108,12 +109,13 @@ class BudgetTest(unittest.TestCase):
         dispatch.assert_not_called()
 
     def test_api_key_budget_reserves_structured_corrective_retry(self) -> None:
-        client = TestClient(create_app(budget_limit_usd="0.00002000"))
+        client = TestClient(create_app(budget_limit_usd="0.00005000"))
 
         with patch.object(
             DeterministicProviderAdapter,
             "dispatch_response",
             autospec=True,
+            return_value=AdapterResponse("{}", 1, 1),
         ) as dispatch:
             response = client.post(
                 "/v1/responses",

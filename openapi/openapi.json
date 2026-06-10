@@ -1252,7 +1252,7 @@
               }
             ],
             "default": null,
-            "description": "JSON Schema Draft 2020-12 object validated by MixAPI for non-streaming json_schema responses.",
+            "description": "JSON Schema Draft 2020-12 object validated by MixAPI for non-streaming json_schema responses; local references are supported and remote references are rejected.",
             "title": "Json Schema"
           },
           "type": {

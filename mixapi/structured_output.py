@@ -11,6 +11,9 @@ from jsonschema.exceptions import SchemaError
 
 
 MAX_VALIDATION_FAILURES = 3
+MAX_FAILURE_PATH_CHARS = 140
+MAX_FAILURE_MESSAGE_CHARS = 64
+CORRECTIVE_RETRY_TOKEN_RESERVE = 320
 
 
 class InvalidResponseSchema(ValueError):
@@ -44,6 +47,8 @@ def response_schema(request_body: dict[str, Any]) -> dict[str, Any] | None:
 def check_response_schema(schema: Any) -> dict[str, Any]:
     if not isinstance(schema, dict):
         raise InvalidResponseSchema("JSON Schema must be an object.")
+    if _contains_remote_reference(schema):
+        raise InvalidResponseSchema("Remote JSON Schema references are not supported.")
     try:
         Draft202012Validator.check_schema(schema)
     except SchemaError as error:
@@ -53,8 +58,8 @@ def check_response_schema(schema: Any) -> dict[str, Any]:
 
 def validate_output(output_text: str, schema: dict[str, Any]) -> StructuredOutputValidation:
     try:
-        value = json.loads(output_text)
-    except (json.JSONDecodeError, TypeError):
+        value = json.loads(output_text, parse_constant=_reject_json_constant)
+    except (json.JSONDecodeError, TypeError, ValueError):
         return StructuredOutputValidation(
             valid=False,
             failures=(ValidationFailure("$", "invalid JSON"),),
@@ -68,14 +73,26 @@ def validate_output(output_text: str, schema: dict[str, Any]) -> StructuredOutpu
     if not errors:
         return StructuredOutputValidation(valid=True, value=value)
 
-    failures = tuple(
-        ValidationFailure(
-            path=_failure_path(error.absolute_path, error.validator, error.message),
-            message=_failure_message(error.validator, error.validator_value),
-        )
-        for error in errors[:MAX_VALIDATION_FAILURES]
+    failures = sorted(
+        (
+            ValidationFailure(
+                path=_bounded_text(
+                    _failure_path(error.absolute_path, error.validator, error.message),
+                    MAX_FAILURE_PATH_CHARS,
+                ),
+                message=_bounded_text(
+                    _failure_message(error.validator, error.validator_value),
+                    MAX_FAILURE_MESSAGE_CHARS,
+                ),
+            )
+            for error in errors
+        ),
+        key=lambda failure: (failure.path, failure.message),
     )
-    return StructuredOutputValidation(valid=False, failures=failures)
+    return StructuredOutputValidation(
+        valid=False,
+        failures=tuple(failures[:MAX_VALIDATION_FAILURES]),
+    )
 
 
 def corrective_request(
@@ -91,7 +108,12 @@ def corrective_request(
     else:
         corrected["input"] = []
 
-    details = "; ".join(f"{failure.path}: {failure.message}" for failure in failures)
+    bounded_failures = failures[:MAX_VALIDATION_FAILURES]
+    details = "; ".join(
+        f"{_bounded_text(failure.path, MAX_FAILURE_PATH_CHARS)}: "
+        f"{_bounded_text(failure.message, MAX_FAILURE_MESSAGE_CHARS)}"
+        for failure in bounded_failures
+    )
     instruction = (
         "Return only JSON that satisfies the requested schema. "
         f"Correct these validation failures: {details}."
@@ -136,3 +158,26 @@ def _failure_message(validator: str | None, validator_value: Any) -> str:
     if validator == "additionalProperties":
         return "additional property is not allowed"
     return "schema constraint failed"
+
+
+def _contains_remote_reference(value: Any) -> bool:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if key in {"$ref", "$dynamicRef"} and isinstance(nested, str):
+                if not nested.startswith("#"):
+                    return True
+            if _contains_remote_reference(nested):
+                return True
+    elif isinstance(value, list):
+        return any(_contains_remote_reference(item) for item in value)
+    return False
+
+
+def _reject_json_constant(_value: str) -> None:
+    raise ValueError("Non-standard JSON constant")
+
+
+def _bounded_text(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    return f"{value[: limit - 3]}..."

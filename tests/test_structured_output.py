@@ -1,3 +1,4 @@
+import json
 import unittest
 from unittest.mock import patch
 
@@ -48,6 +49,14 @@ class StructuredOutputUnitTest(unittest.TestCase):
                 with self.assertRaises(InvalidResponseSchema):
                     check_response_schema(schema)
 
+    def test_check_response_schema_rejects_remote_references(self) -> None:
+        for keyword in ("$ref", "$dynamicRef"):
+            with self.subTest(keyword=keyword):
+                with self.assertRaises(InvalidResponseSchema):
+                    check_response_schema(
+                        {keyword: "https://schemas.example.com/customer.json"}
+                    )
+
     def test_validate_output_parses_and_validates_json(self) -> None:
         schema = {
             "type": "object",
@@ -70,6 +79,17 @@ class StructuredOutputUnitTest(unittest.TestCase):
         self.assertFalse(result.valid)
         self.assertEqual(result.failures, (ValidationFailure("$", "invalid JSON"),))
         self.assertNotIn(invalid_output, repr(result))
+
+    def test_validate_output_rejects_nonstandard_json_constants(self) -> None:
+        for output in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(output=output):
+                result = validate_output(output, {})
+
+                self.assertFalse(result.valid)
+                self.assertEqual(
+                    result.failures,
+                    (ValidationFailure("$", "invalid JSON"),),
+                )
 
     def test_validate_output_sorts_and_bounds_path_failures(self) -> None:
         schema = {
@@ -132,6 +152,24 @@ class StructuredOutputUnitTest(unittest.TestCase):
         self.assertIn("$.customer.email: expected string", instruction)
         self.assertIn("$.customer.name: required property", instruction)
         self.assertNotIn("private invalid output", repr(corrected))
+
+    def test_validation_paths_and_corrective_instruction_are_character_bounded(self) -> None:
+        property_name = "field " * 100
+        schema = {
+            "type": "object",
+            "properties": {property_name: {"type": "string"}},
+        }
+
+        result = validate_output(json.dumps({property_name: 7}), schema)
+        corrected = corrective_request(
+            {"input": "Return JSON"},
+            result.failures,
+        )
+
+        self.assertFalse(result.valid)
+        self.assertLessEqual(len(result.failures[0].path), 160)
+        self.assertLessEqual(len(result.failures[0].message), 80)
+        self.assertLessEqual(len(corrected["input"][-1]["content"]), 800)
 
 
 class StructuredOutputEndpointTest(unittest.TestCase):
@@ -250,6 +288,8 @@ class StructuredOutputEndpointTest(unittest.TestCase):
         self.assertEqual(response.json()["error"]["type"], "structured_output_error")
         self.assertEqual(response.json()["error"]["code"], "schema_validation_failed")
         self.assertIn("$.ok", response.json()["error"]["message"])
+        self.assertIn("openai/gpt-4.1-mini", response.json()["error"]["message"])
+        self.assertIn("gemini/gemini-2.5-flash", response.json()["error"]["message"])
         self.assertEqual(dispatch.call_count, 4)
         self.assertEqual(len(app.state.usage_ledger.events()), 4)
         self.assertFalse(app.state.circuits.is_open("openai", "gpt-4.1-mini"))

@@ -120,6 +120,10 @@ class OpenAPIContractTest(unittest.TestCase):
             "non-streaming",
             schema["properties"]["json_schema"]["description"],
         )
+        self.assertIn(
+            "local references",
+            schema["properties"]["json_schema"]["description"],
+        )
 
     def test_streaming_and_export_media_types_are_documented(self) -> None:
         response_operation = self.contract["paths"]["/v1/responses"]["post"]

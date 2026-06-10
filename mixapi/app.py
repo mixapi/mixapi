@@ -67,6 +67,7 @@ from mixapi.route_decisions import InMemoryRouteDecisionStore, RouteDecisionReco
 from mixapi.routing import plan_route
 from mixapi.streaming import encode_sse
 from mixapi.structured_output import (
+    CORRECTIVE_RETRY_TOKEN_RESERVE,
     ValidationFailure,
     corrective_request,
     response_schema,
@@ -905,10 +906,19 @@ def _public_error_for_failed_attempts(
 ) -> MixAPIError:
     reasons = {attempt["reason"] for attempt in failed_attempts}
     if reasons == {"schema_validation_failed"}:
+        providers = []
+        for attempt in failed_attempts:
+            provider_model = f"{attempt['provider']}/{attempt['provider_model']}"
+            if provider_model not in providers:
+                providers.append(provider_model)
+        attempt_summary = ", ".join(providers[:4])
         details = "; ".join(
             f"{failure.path}: {failure.message}" for failure in validation_failures
         )
-        message = "All eligible providers returned output that failed JSON Schema validation."
+        message = (
+            "All eligible providers returned output that failed JSON Schema validation. "
+            f"Attempts: {attempt_summary}."
+        )
         if details:
             message = f"{message} {details}."
         return structured_output_error("schema_validation_failed", message)
@@ -940,7 +950,11 @@ def _budget_eligible_candidates(
     estimates: list[Decimal] = []
     structured = endpoint == "responses" and response_schema(request_body) is not None
     for candidate in candidates:
-        estimate = _estimate_candidate_request_cost(request_body, candidate, endpoint)
+        estimate = (
+            _estimate_structured_candidate_request_cost(request_body, candidate)
+            if structured
+            else _estimate_candidate_request_cost(request_body, candidate, endpoint)
+        )
         if request_limit is not None and not structured and estimate > request_limit:
             rejected.append(
                 {
@@ -959,7 +973,7 @@ def _budget_eligible_candidates(
             "No eligible provider fits the request cost limit.",
         )
     estimated_cost = (
-        sum(estimates, Decimal("0")) * 2
+        sum(estimates, Decimal("0"))
         if structured
         else max(estimates, default=Decimal("0"))
     )
@@ -1067,6 +1081,27 @@ def _estimate_candidate_request_cost(request_body: dict[str, Any], candidate, en
     )
 
 
+def _estimate_structured_candidate_request_cost(
+    request_body: dict[str, Any],
+    candidate: ProviderModel,
+) -> Decimal:
+    input_tokens = count_tokens(extract_text(request_body.get("input", "")))
+    output_tokens = request_body.get("max_output_tokens", candidate.max_output_tokens)
+    first_dispatch = _estimate_cost(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        input_price=candidate.pricing.get("input_per_million", "0"),
+        output_price=candidate.pricing.get("output_per_million", "0"),
+    )
+    corrective_dispatch = _estimate_cost(
+        input_tokens=input_tokens + CORRECTIVE_RETRY_TOKEN_RESERVE,
+        output_tokens=output_tokens,
+        input_price=candidate.pricing.get("input_per_million", "0"),
+        output_price=candidate.pricing.get("output_per_million", "0"),
+    )
+    return first_dispatch + corrective_dispatch
+
+
 def _estimate_request_tokens(request_body: dict[str, Any], candidates, endpoint: str) -> int:
     if endpoint == "embeddings":
         return count_tokens(embedding_text(request_body.get("input", "")))
@@ -1077,7 +1112,10 @@ def _estimate_request_tokens(request_body: dict[str, Any], candidates, endpoint:
         for candidate in candidates
     ]
     if response_schema(request_body) is not None:
-        return sum(candidate_tokens) * 2
+        return sum(
+            candidate_token_count * 2 + CORRECTIVE_RETRY_TOKEN_RESERVE
+            for candidate_token_count in candidate_tokens
+        )
     return max(candidate_tokens, default=input_tokens)
 
 

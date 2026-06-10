@@ -60,7 +60,8 @@ class ResponseFormat(ContractModel):
         default=None,
         description=(
             "JSON Schema Draft 2020-12 object validated by MixAPI for non-streaming "
-            "json_schema responses."
+            "json_schema responses; local references are supported and remote references "
+            "are rejected."
         ),
     )
 

@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from mixapi.adapters import DeterministicProviderAdapter
+from mixapi.adapters import AdapterResponse, DeterministicProviderAdapter
 from mixapi.app import create_app
 
 
@@ -150,12 +150,13 @@ class QuotaUsageEmbeddingsTest(unittest.TestCase):
         self.assertEqual(second.json()["error"]["code"], "token_quota_exceeded")
 
     def test_structured_request_reserves_tokens_for_corrective_retry(self) -> None:
-        client = TestClient(create_app(token_quota_limit=15))
+        client = TestClient(create_app(token_quota_limit=100))
 
         with patch.object(
             DeterministicProviderAdapter,
             "dispatch_response",
             autospec=True,
+            return_value=AdapterResponse("{}", 1, 1),
         ) as dispatch:
             response = client.post(
                 "/v1/responses",
