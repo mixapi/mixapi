@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ipaddress
+import uuid
 from typing import Protocol
 from urllib.parse import urlsplit
 
@@ -23,6 +24,10 @@ class PublicationError(ValueError):
 
 
 class PublicationLeaseLost(RuntimeError):
+    pass
+
+
+class RebuildInProgress(RuntimeError):
     pass
 
 
@@ -132,6 +137,15 @@ class ConfigurationPublisher:
         return snapshot
 
     def rebuild(self) -> bool:
+        owner = f"rebuild_{uuid.uuid4().hex}"
+        if not self._snapshots.acquire_rebuild_lock(owner, ttl_seconds=30):
+            raise RebuildInProgress("A configuration rebuild is already in progress")
+        try:
+            return self._rebuild_locked()
+        finally:
+            self._snapshots.release_rebuild_lock(owner)
+
+    def _rebuild_locked(self) -> bool:
         version = self._repository.latest_published_version()
         if version is None:
             return False

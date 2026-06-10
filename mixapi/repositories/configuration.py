@@ -378,6 +378,7 @@ class PostgresConfigurationRepository:
         description: str | object = _UNSET,
         aliases: Iterable[str] | object = _UNSET,
         status: str | object = _UNSET,
+        expected_updated_at: datetime | None = None,
     ) -> ConfigurationMutationResult[LogicalModelRecord]:
         try:
             with self._pool.connection() as connection:
@@ -389,6 +390,8 @@ class PostgresConfigurationRepository:
                     raise ConfigurationNotFound(f"logical model not found: {model_id}")
                 current_aliases = self._load_aliases(connection, (model_id,)).get(model_id, ())
                 current = _logical_model_from_row(current_row, current_aliases)
+                if expected_updated_at is not None and current.updated_at != expected_updated_at:
+                    raise ConfigurationConflict("logical model was modified by another request")
                 next_status = current.status if status is _UNSET else str(status)
                 _validate_status(next_status)
                 next_aliases = current.aliases if aliases is _UNSET else _normalize_aliases(aliases, model_id)
@@ -565,6 +568,7 @@ class PostgresConfigurationRepository:
         candidate_id: str,
         *,
         actor_id: str,
+        expected_updated_at: datetime | None = None,
         **changes: Any,
     ) -> ConfigurationMutationResult[ModelCandidateRecord]:
         allowed = {
@@ -586,6 +590,8 @@ class PostgresConfigurationRepository:
                 if current_row is None:
                     raise ConfigurationNotFound(f"candidate not found: {candidate_id}")
                 current = _candidate_from_row(current_row)
+                if expected_updated_at is not None and current.updated_at != expected_updated_at:
+                    raise ConfigurationConflict("candidate was modified by another request")
                 values = current.public_dict()
                 values.update(changes)
                 _validate_candidate(
@@ -706,6 +712,40 @@ class PostgresConfigurationRepository:
                 "SELECT * FROM configuration_versions ORDER BY version DESC LIMIT 1"
             ).fetchone()
         return _version_from_row(row) if row is not None else None
+
+    def get_configuration_version(self, version: int) -> ConfigurationVersion:
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM configuration_versions WHERE version = %s",
+                (version,),
+            ).fetchone()
+        if row is None:
+            raise ConfigurationNotFound(f"configuration version not found: {version}")
+        return _version_from_row(row)
+
+    def count_active_candidates(
+        self,
+        logical_model_id: str,
+        *,
+        exclude_candidate_id: str | None = None,
+    ) -> int:
+        exclusion = "" if exclude_candidate_id is None else "AND id <> %s"
+        parameters: tuple[Any, ...] = (
+            (logical_model_id,)
+            if exclude_candidate_id is None
+            else (logical_model_id, exclude_candidate_id)
+        )
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                f"""
+                SELECT count(*) AS count FROM model_candidates
+                WHERE logical_model_id = %s AND status = 'active'
+                  AND deleted_at IS NULL
+                  {exclusion}
+                """,
+                parameters,
+            ).fetchone()
+        return row["count"]
 
     def mark_configuration_published(
         self,

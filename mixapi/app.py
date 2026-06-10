@@ -31,6 +31,8 @@ from mixapi.adapters import (
     extract_text,
 )
 from mixapi.admin.providers import create_provider_router
+from mixapi.admin.models import create_model_router
+from mixapi.admin.publication import create_publication_router
 from mixapi.api_contract import install_openapi_contract
 from mixapi.auth import (
     AdminPrincipal,
@@ -293,6 +295,7 @@ def create_app(
                 "configuration-rebuild",
                 configured_settings.configuration_rebuild_interval_seconds,
                 configuration_rebuild_worker.run_once,
+                run_immediately=False,
             ),
             WorkerJob(
                 "usage-intent-recovery",
@@ -338,6 +341,15 @@ def create_app(
             configuration_repository,
             authenticate_admin,
             connection_tester,
+        )
+    )
+    app.include_router(create_model_router(configuration_repository, authenticate_admin))
+    app.include_router(
+        create_publication_router(
+            configuration_repository,
+            configuration_publisher,
+            snapshot_store,
+            authenticate_admin,
         )
     )
 

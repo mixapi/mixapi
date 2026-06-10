@@ -60,12 +60,21 @@ return 1
 """
 
 
+_RELEASE_LOCK = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+
+
 class RedisSnapshotStore:
     def __init__(self, client: redis.Redis, *, namespace: str) -> None:
         self._client = client
         self._prefix = f"{namespace}:v1:snapshots"
         self._mark_ready_script = LuaScript(client, _MARK_READY)
         self._activate_script = LuaScript(client, _ACTIVATE)
+        self._release_lock_script = LuaScript(client, _RELEASE_LOCK)
 
     def write_pending(self, snapshot: ConfigurationSnapshot) -> bool:
         payload = snapshot.to_json()
@@ -193,6 +202,27 @@ class RedisSnapshotStore:
                     self._client.delete(*keys)
         except (redis.RedisError, OSError) as error:
             raise control_plane_unavailable() from error
+
+    def acquire_rebuild_lock(self, owner: str, *, ttl_seconds: int) -> bool:
+        try:
+            return bool(
+                self._client.set(
+                    f"{self._prefix}:rebuild-lock",
+                    owner,
+                    nx=True,
+                    ex=ttl_seconds,
+                )
+            )
+        except (redis.RedisError, OSError) as error:
+            raise control_plane_unavailable() from error
+
+    def release_rebuild_lock(self, owner: str) -> bool:
+        return bool(
+            self._release_lock_script(
+                [f"{self._prefix}:rebuild-lock"],
+                [owner],
+            )
+        )
 
     def _active_key(self) -> str:
         return f"{self._prefix}:active"

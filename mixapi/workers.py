@@ -80,6 +80,7 @@ class WorkerJob:
     name: str
     interval_seconds: float
     action: Callable[[], object]
+    run_immediately: bool = True
 
 
 class ManagedWorkers:
@@ -116,6 +117,11 @@ class ManagedWorkers:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _run(self, job: WorkerJob) -> None:
+        if not job.run_immediately:
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=job.interval_seconds)
+            except TimeoutError:
+                pass
         while not self._stop.is_set():
             try:
                 await asyncio.to_thread(job.action)
