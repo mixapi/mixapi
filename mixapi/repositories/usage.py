@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from datetime import timedelta
 from decimal import Decimal
 from typing import Any, Iterable
 
@@ -50,6 +51,28 @@ class PostgresUsageLedger:
                 """,
                 (request_id,),
             )
+
+    def fail_expired_intents(self, *, stale_seconds: int, limit: int = 100) -> int:
+        with self._pool.connection() as connection:
+            rows = connection.execute(
+                """
+                WITH expired AS (
+                    SELECT id FROM usage_write_intents
+                    WHERE status = 'pending'
+                      AND updated_at < now() - %s
+                    ORDER BY updated_at, id
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT %s
+                )
+                UPDATE usage_write_intents AS intent
+                SET status = 'failed', updated_at = now(), completed_at = now()
+                FROM expired
+                WHERE intent.id = expired.id
+                RETURNING intent.id
+                """,
+                (timedelta(seconds=stale_seconds), limit),
+            ).fetchall()
+        return len(rows)
 
     def record(self, event: UsageEvent) -> UsageEvent:
         recorded = self.settle_reservation(

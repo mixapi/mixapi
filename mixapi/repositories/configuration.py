@@ -662,35 +662,149 @@ class PostgresConfigurationRepository:
 
     def load_active_configuration(self) -> StoredConfiguration:
         with self._pool.connection() as connection:
-            provider_rows = connection.execute(
+            return self._load_active_configuration(connection)
+
+    def load_publication_configuration(
+        self,
+        version: int,
+    ) -> tuple[ConfigurationVersion, StoredConfiguration]:
+        with self._pool.connection() as connection:
+            connection.execute(
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+            )
+            version_row = connection.execute(
+                "SELECT * FROM configuration_versions WHERE version = %s",
+                (version,),
+            ).fetchone()
+            if version_row is None:
+                raise ConfigurationNotFound(f"configuration version not found: {version}")
+            configuration = self._load_active_configuration(connection)
+        return _version_from_row(version_row), configuration
+
+    def latest_published_version(self) -> ConfigurationVersion | None:
+        with self._pool.connection() as connection:
+            row = connection.execute(
                 """
-                SELECT * FROM provider_connections
-                WHERE status = 'active' AND deleted_at IS NULL
-                ORDER BY name, id
+                SELECT * FROM configuration_versions
+                WHERE status = 'published'
+                ORDER BY version DESC LIMIT 1
                 """
-            ).fetchall()
-            model_rows = connection.execute(
+            ).fetchone()
+        return _version_from_row(row) if row is not None else None
+
+    def mark_configuration_published(
+        self,
+        version: int,
+        checksum: str,
+        *,
+        event_id: int | None = None,
+        worker_id: str | None = None,
+    ) -> bool:
+        with self._pool.connection() as connection:
+            if event_id is not None and not self._owns_outbox_claim(
+                connection,
+                event_id,
+                version,
+                worker_id,
+            ):
+                return False
+            row = connection.execute(
                 """
-                SELECT * FROM logical_models
-                WHERE status = 'active' AND deleted_at IS NULL
-                ORDER BY id
+                UPDATE configuration_versions
+                SET status = 'published', checksum = %s, published_at = now(),
+                    error_code = NULL, error_message = NULL, failed_at = NULL
+                WHERE version = %s
+                RETURNING version
+                """,
+                (checksum, version),
+            ).fetchone()
+            if row is None:
+                return False
+            connection.execute(
                 """
-            ).fetchall()
-            model_ids = tuple(row["id"] for row in model_rows)
-            aliases = self._load_aliases(connection, model_ids)
-            candidate_rows = connection.execute(
+                UPDATE configuration_outbox
+                SET processed_at = COALESCE(processed_at, now()),
+                    claimed_by = NULL, claimed_at = NULL,
+                    claim_expires_at = NULL, last_error = NULL
+                WHERE configuration_version = %s
+                """,
+                (version,),
+            )
+        return True
+
+    def mark_configuration_failed(
+        self,
+        version: int,
+        *,
+        error_code: str,
+        error_message: str,
+        event_id: int | None = None,
+        worker_id: str | None = None,
+    ) -> bool:
+        safe_code = error_code[:100]
+        safe_message = error_message[:500]
+        with self._pool.connection() as connection:
+            if event_id is not None and not self._owns_outbox_claim(
+                connection,
+                event_id,
+                version,
+                worker_id,
+            ):
+                return False
+            row = connection.execute(
                 """
-                SELECT candidate.*
-                FROM model_candidates AS candidate
-                JOIN logical_models AS model ON model.id = candidate.logical_model_id
-                JOIN provider_connections AS provider
-                  ON provider.id = candidate.provider_connection_id
-                WHERE candidate.status = 'active' AND candidate.deleted_at IS NULL
-                  AND model.status = 'active' AND model.deleted_at IS NULL
-                  AND provider.status = 'active' AND provider.deleted_at IS NULL
-                ORDER BY candidate.logical_model_id, candidate.priority, candidate.id
+                UPDATE configuration_versions
+                SET status = 'failed', error_code = %s, error_message = %s,
+                    failed_at = now()
+                WHERE version = %s
+                RETURNING version
+                """,
+                (safe_code, safe_message, version),
+            ).fetchone()
+            if row is None:
+                return False
+            connection.execute(
                 """
-            ).fetchall()
+                UPDATE configuration_outbox
+                SET processed_at = COALESCE(processed_at, now()),
+                    claimed_by = NULL, claimed_at = NULL,
+                    claim_expires_at = NULL, last_error = %s
+                WHERE configuration_version = %s
+                """,
+                (safe_message, version),
+            )
+        return True
+
+    def _load_active_configuration(self, connection: Connection) -> StoredConfiguration:
+        provider_rows = connection.execute(
+            """
+            SELECT * FROM provider_connections
+            WHERE status = 'active' AND deleted_at IS NULL
+            ORDER BY name, id
+            """
+        ).fetchall()
+        model_rows = connection.execute(
+            """
+            SELECT * FROM logical_models
+            WHERE status = 'active' AND deleted_at IS NULL
+            ORDER BY id
+            """
+        ).fetchall()
+        model_ids = tuple(row["id"] for row in model_rows)
+        aliases = self._load_aliases(connection, model_ids)
+        candidate_rows = connection.execute(
+            """
+            SELECT candidate.*
+            FROM model_candidates AS candidate
+            JOIN logical_models AS model ON model.id = candidate.logical_model_id
+            JOIN provider_connections AS provider
+              ON provider.id = candidate.provider_connection_id
+            WHERE candidate.status = 'active' AND candidate.deleted_at IS NULL
+              AND model.status = 'active' AND model.deleted_at IS NULL
+              AND provider.status = 'active' AND provider.deleted_at IS NULL
+            ORDER BY candidate.logical_model_id, candidate.priority, candidate.id
+            """
+        ).fetchall()
         return StoredConfiguration(
             providers=tuple(_provider_from_row(row) for row in provider_rows),
             logical_models=tuple(
@@ -699,6 +813,27 @@ class PostgresConfigurationRepository:
             candidates=tuple(_candidate_from_row(row) for row in candidate_rows),
             aliases={alias: model_id for model_id, values in aliases.items() for alias in values},
         )
+
+    @staticmethod
+    def _owns_outbox_claim(
+        connection: Connection,
+        event_id: int,
+        version: int,
+        worker_id: str | None,
+    ) -> bool:
+        if not worker_id:
+            return False
+        row = connection.execute(
+            """
+            SELECT id FROM configuration_outbox
+            WHERE id = %s AND configuration_version = %s
+              AND claimed_by = %s AND processed_at IS NULL
+              AND claim_expires_at >= now()
+            FOR UPDATE
+            """,
+            (event_id, version, worker_id),
+        ).fetchone()
+        return row is not None
 
     def claim_outbox(
         self,

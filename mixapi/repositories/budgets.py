@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import timedelta
 from decimal import Decimal
 from typing import Iterable
 
@@ -11,6 +13,14 @@ from mixapi.errors import budget_exceeded
 from mixapi.postgres import PostgresPool
 from mixapi.repositories.usage import PostgresUsageLedger
 from mixapi.usage import UsageEvent
+
+
+@dataclass(frozen=True)
+class BudgetReconciliationRecord:
+    id: int
+    reservation_id: str
+    api_key_id: str
+    amount_usd: Decimal
 
 
 class PostgresBudgetService:
@@ -163,6 +173,79 @@ class PostgresBudgetService:
                 """,
                 (reservation_id,),
             )
+
+    def claim_reconciliations(
+        self,
+        worker_id: str,
+        *,
+        limit: int = 100,
+        lease_seconds: int = 30,
+    ) -> list[BudgetReconciliationRecord]:
+        with self._pool.connection() as connection:
+            rows = connection.execute(
+                """
+                WITH candidates AS (
+                    SELECT id FROM budget_reconciliation_outbox
+                    WHERE processed_at IS NULL
+                      AND (claim_expires_at IS NULL OR claim_expires_at < now())
+                    ORDER BY id
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT %s
+                )
+                UPDATE budget_reconciliation_outbox AS outbox
+                SET claimed_by = %s, claimed_at = now(),
+                    claim_expires_at = now() + %s,
+                    attempts = attempts + 1, last_error = NULL
+                FROM candidates
+                WHERE outbox.id = candidates.id
+                RETURNING outbox.id, outbox.reservation_id,
+                          outbox.api_key_id, outbox.amount_usd
+                """,
+                (limit, worker_id, timedelta(seconds=lease_seconds)),
+            ).fetchall()
+        return [
+            BudgetReconciliationRecord(
+                id=row["id"],
+                reservation_id=row["reservation_id"],
+                api_key_id=row["api_key_id"],
+                amount_usd=row["amount_usd"],
+            )
+            for row in rows
+        ]
+
+    def complete_reconciliation(self, record_id: int, worker_id: str) -> bool:
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                """
+                UPDATE budget_reconciliation_outbox
+                SET processed_at = now(), claim_expires_at = NULL
+                WHERE id = %s AND claimed_by = %s AND processed_at IS NULL
+                  AND claim_expires_at >= now()
+                RETURNING id
+                """,
+                (record_id, worker_id),
+            ).fetchone()
+        return row is not None
+
+    def release_reconciliation(
+        self,
+        record_id: int,
+        worker_id: str,
+        *,
+        error: str,
+    ) -> bool:
+        with self._pool.connection() as connection:
+            row = connection.execute(
+                """
+                UPDATE budget_reconciliation_outbox
+                SET claimed_by = NULL, claimed_at = NULL, claim_expires_at = NULL,
+                    last_error = %s
+                WHERE id = %s AND claimed_by = %s AND processed_at IS NULL
+                RETURNING id
+                """,
+                (error[:500], record_id, worker_id),
+            ).fetchone()
+        return row is not None
 
 
 def _budget_intent_id(reservation_id: str) -> str:

@@ -123,6 +123,37 @@ class RedisBudgetService:
         keys = self._keys(reservation.api_key_id, reservation.reservation_id)
         self._release([keys[1], keys[2]], [])
 
+    def reconcile_pending(
+        self,
+        worker_id: str,
+        *,
+        limit: int = 100,
+        lease_seconds: int = 30,
+    ) -> int:
+        records = self._durable.claim_reconciliations(
+            worker_id,
+            limit=limit,
+            lease_seconds=lease_seconds,
+        )
+        processed = 0
+        for record in records:
+            try:
+                actual = self._durable.actual_spend(record.api_key_id)
+                self._reconcile(
+                    self._keys(record.api_key_id, record.reservation_id),
+                    [_units(actual), self._reconciliation_ttl_seconds],
+                )
+                if self._durable.complete_reconciliation(record.id, worker_id):
+                    processed += 1
+            except Exception as error:
+                self._durable.release_reconciliation(
+                    record.id,
+                    worker_id,
+                    error=f"{type(error).__name__}: reconciliation failed",
+                )
+                raise
+        return processed
+
     def _finish_redis_reconciliation(self, reservation: BudgetReservation) -> None:
         if reservation.tracked:
             actual = self._durable.actual_spend(reservation.api_key_id)

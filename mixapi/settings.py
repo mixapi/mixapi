@@ -25,6 +25,15 @@ class Settings:
     auth_cache_ttl_seconds: int = 60
     redis_namespace: str = "mixapi"
     idempotency_ttl_seconds: int = 86_400
+    snapshot_retention_count: int = 3
+    snapshot_retention_ttl_seconds: int = 300
+    configuration_publisher_interval_seconds: float = 0.5
+    configuration_rebuild_interval_seconds: float = 60.0
+    outbox_claim_lease_seconds: int = 30
+    usage_intent_recovery_interval_seconds: float = 60.0
+    usage_intent_stale_seconds: int = 300
+    budget_reconciliation_interval_seconds: float = 1.0
+    worker_shutdown_timeout_seconds: float = 5.0
 
     def __post_init__(self) -> None:
         if not self.database_url.strip():
@@ -53,6 +62,24 @@ class Settings:
             raise ConfigurationError("Redis namespace must be non-empty and cannot contain ':'")
         if self.idempotency_ttl_seconds <= 0:
             raise ConfigurationError("Idempotency TTL must be positive")
+        if self.snapshot_retention_count <= 0:
+            raise ConfigurationError("Snapshot retention count must be positive")
+        if self.snapshot_retention_ttl_seconds <= 0:
+            raise ConfigurationError("Snapshot retention TTL must be positive")
+        if self.configuration_publisher_interval_seconds <= 0:
+            raise ConfigurationError("Configuration publisher interval must be positive")
+        if self.configuration_rebuild_interval_seconds <= 0:
+            raise ConfigurationError("Configuration rebuild interval must be positive")
+        if self.outbox_claim_lease_seconds <= 0:
+            raise ConfigurationError("Outbox claim lease must be positive")
+        if self.usage_intent_recovery_interval_seconds <= 0:
+            raise ConfigurationError("Usage intent recovery interval must be positive")
+        if self.usage_intent_stale_seconds <= 0:
+            raise ConfigurationError("Usage intent stale threshold must be positive")
+        if self.budget_reconciliation_interval_seconds <= 0:
+            raise ConfigurationError("Budget reconciliation interval must be positive")
+        if self.worker_shutdown_timeout_seconds <= 0:
+            raise ConfigurationError("Worker shutdown timeout must be positive")
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -87,6 +114,42 @@ class Settings:
             idempotency_ttl_seconds=_env_positive_int(
                 "MIXAPI_IDEMPOTENCY_TTL_SECONDS",
                 86_400,
+            ),
+            snapshot_retention_count=_env_positive_int(
+                "MIXAPI_SNAPSHOT_RETENTION_COUNT",
+                3,
+            ),
+            snapshot_retention_ttl_seconds=_env_positive_int(
+                "MIXAPI_SNAPSHOT_RETENTION_TTL_SECONDS",
+                300,
+            ),
+            configuration_publisher_interval_seconds=_env_positive_float(
+                "MIXAPI_CONFIGURATION_PUBLISHER_INTERVAL_SECONDS",
+                0.5,
+            ),
+            configuration_rebuild_interval_seconds=_env_positive_float(
+                "MIXAPI_CONFIGURATION_REBUILD_INTERVAL_SECONDS",
+                60.0,
+            ),
+            outbox_claim_lease_seconds=_env_positive_int(
+                "MIXAPI_OUTBOX_CLAIM_LEASE_SECONDS",
+                30,
+            ),
+            usage_intent_recovery_interval_seconds=_env_positive_float(
+                "MIXAPI_USAGE_INTENT_RECOVERY_INTERVAL_SECONDS",
+                60.0,
+            ),
+            usage_intent_stale_seconds=_env_positive_int(
+                "MIXAPI_USAGE_INTENT_STALE_SECONDS",
+                300,
+            ),
+            budget_reconciliation_interval_seconds=_env_positive_float(
+                "MIXAPI_BUDGET_RECONCILIATION_INTERVAL_SECONDS",
+                1.0,
+            ),
+            worker_shutdown_timeout_seconds=_env_positive_float(
+                "MIXAPI_WORKER_SHUTDOWN_TIMEOUT_SECONDS",
+                5.0,
             ),
         )
 

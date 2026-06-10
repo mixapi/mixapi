@@ -54,12 +54,14 @@ from mixapi.errors import (
 from mixapi.models import ProviderModel
 from mixapi.observability import InMemoryObservability, Observability, SafeObservability
 from mixapi.postgres import PostgresPool
+from mixapi.publication import ConfigurationPublisher
 from mixapi.persistence import (
     SQLiteDatabase,
 )
 from mixapi.quota import QuotaService, TokenReservation
 from mixapi.redis_runtime import RedisRuntime
 from mixapi.repositories.budgets import PostgresBudgetService
+from mixapi.repositories.configuration import PostgresConfigurationRepository
 from mixapi.repositories.control_plane import PostgresControlPlaneStore
 from mixapi.repositories.route_decisions import PostgresRouteDecisionStore
 from mixapi.repositories.usage import PostgresUsageLedger
@@ -67,6 +69,7 @@ from mixapi.runtime.budget import RedisBudgetService
 from mixapi.runtime.circuits import RedisCircuitBreaker
 from mixapi.runtime.idempotency import RedisIdempotencyStore
 from mixapi.runtime.quota import RedisQuotaService
+from mixapi.runtime.snapshots import RedisSnapshotStore
 from mixapi.route_decisions import RouteDecisionRecord
 from mixapi.routing import plan_route
 from mixapi.streaming import encode_sse
@@ -78,6 +81,7 @@ from mixapi.structured_output import (
     validate_output,
 )
 from mixapi.settings import Settings
+from mixapi.secrets import CredentialCipher
 from mixapi.usage import (
     UsageEvent,
     UsageQueryValidationError,
@@ -89,6 +93,12 @@ from mixapi.usage import (
     usage_response,
 )
 from mixapi.validation import validate_embedding_request, validate_response_request
+from mixapi.workers import (
+    ConfigurationOutboxWorker,
+    ConfigurationRebuildWorker,
+    ManagedWorkers,
+    WorkerJob,
+)
 
 
 def create_app(
@@ -126,8 +136,10 @@ def create_app(
             postgres_pool.close()
             raise
         try:
+            await managed_workers.start()
             yield
         finally:
+            await managed_workers.stop()
             redis_runtime.close()
             postgres_pool.close()
 
@@ -226,6 +238,63 @@ def create_app(
         ttl_seconds=configured_settings.idempotency_ttl_seconds,
     )
     route_decision_store = PostgresRouteDecisionStore(postgres_pool)
+    credential_cipher = CredentialCipher(
+        configured_settings.master_key,
+        active_version=configured_settings.master_key_version,
+        previous_keys=configured_settings.previous_master_keys,
+    )
+    configuration_repository = PostgresConfigurationRepository(
+        postgres_pool,
+        credential_cipher,
+    )
+    snapshot_store = RedisSnapshotStore(
+        redis_runtime.client,
+        namespace=configured_settings.redis_namespace,
+    )
+    configuration_publisher = ConfigurationPublisher(
+        configuration_repository,
+        snapshot_store,
+        retention_count=configured_settings.snapshot_retention_count,
+        retention_ttl_seconds=configured_settings.snapshot_retention_ttl_seconds,
+    )
+    worker_id = f"instance_{uuid.uuid4().hex}"
+    configuration_outbox_worker = ConfigurationOutboxWorker(
+        configuration_repository,
+        configuration_publisher,
+        worker_id=worker_id,
+        lease_seconds=configured_settings.outbox_claim_lease_seconds,
+    )
+    configuration_rebuild_worker = ConfigurationRebuildWorker(configuration_publisher)
+    managed_workers = ManagedWorkers(
+        (
+            WorkerJob(
+                "configuration-publisher",
+                configured_settings.configuration_publisher_interval_seconds,
+                configuration_outbox_worker.run_once,
+            ),
+            WorkerJob(
+                "configuration-rebuild",
+                configured_settings.configuration_rebuild_interval_seconds,
+                configuration_rebuild_worker.run_once,
+            ),
+            WorkerJob(
+                "usage-intent-recovery",
+                configured_settings.usage_intent_recovery_interval_seconds,
+                lambda: usage_ledger.fail_expired_intents(
+                    stale_seconds=configured_settings.usage_intent_stale_seconds
+                ),
+            ),
+            WorkerJob(
+                "budget-reconciliation",
+                configured_settings.budget_reconciliation_interval_seconds,
+                lambda: budget.reconcile_pending(
+                    worker_id,
+                    lease_seconds=configured_settings.outbox_claim_lease_seconds,
+                ),
+            ),
+        ),
+        shutdown_timeout_seconds=configured_settings.worker_shutdown_timeout_seconds,
+    )
     if observability is None:
         observability = InMemoryObservability()
     instrumentation = SafeObservability(observability)
@@ -241,6 +310,10 @@ def create_app(
     app.state.settings = configured_settings
     app.state.postgres_pool = postgres_pool
     app.state.redis_runtime = redis_runtime
+    app.state.configuration_repository = configuration_repository
+    app.state.snapshot_store = snapshot_store
+    app.state.configuration_publisher = configuration_publisher
+    app.state.workers = managed_workers
 
     @app.middleware("http")
     async def attach_request_context(request: Request, call_next):
