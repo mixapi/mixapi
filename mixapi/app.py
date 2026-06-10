@@ -48,7 +48,7 @@ from mixapi.errors import (
     validation_error,
 )
 from mixapi.idempotency import InMemoryIdempotencyStore
-from mixapi.observability import InMemoryObservability
+from mixapi.observability import InMemoryObservability, Observability
 from mixapi.persistence import (
     SQLiteBudgetService,
     SQLiteCircuitBreaker,
@@ -94,7 +94,7 @@ def create_app(
     circuit_recovery_seconds: float | None = None,
     token_quota_limit: int | None = None,
     admin_api_key: str | None = None,
-    observability: InMemoryObservability | None = None,
+    observability: Observability | None = None,
 ) -> FastAPI:
     app = FastAPI(title="MixAPI", version="0.1.0")
     catalog = default_catalog()
@@ -189,7 +189,8 @@ def create_app(
     route_decision_store = (
         SQLiteRouteDecisionStore(database) if database else InMemoryRouteDecisionStore()
     )
-    observability = observability or InMemoryObservability()
+    if observability is None:
+        observability = InMemoryObservability()
     app.state.usage_ledger = usage_ledger
     app.state.idempotency_store = idempotency_store
     app.state.route_decision_store = route_decision_store
@@ -246,6 +247,7 @@ def create_app(
         circuit_candidates, circuit_rejections = _circuit_eligible_candidates(
             decision.candidates,
             circuits,
+            observability,
         )
         if not circuit_candidates:
             route_decision_store.record(
@@ -266,17 +268,16 @@ def create_app(
                 "all_provider_circuits_open",
                 "All eligible provider circuits are open.",
             )
-        candidates, budget_rejections, estimated_cost = _budget_eligible_candidates(
+        candidates, budget_rejections, reservation = _reserve_budget(
             circuit_candidates,
             request_body,
             endpoint="responses",
+            budget=budget,
+            principal=principal,
+            observability=observability,
+            trace_id=request.state.trace_id,
         )
         rejected_candidates = (*decision.rejected, *circuit_rejections, *budget_rejections)
-        reservation = budget.reserve(
-            principal,
-            estimated_cost,
-            limit_usd=principal.budget_limit_usd,
-        )
         try:
             token_reservation = _reserve_quotas(
                 quota,
@@ -301,6 +302,7 @@ def create_app(
             except AllCandidatesFailed as error:
                 _record_fallback_transitions(
                     observability,
+                    request.state.trace_id,
                     principal,
                     request_body["model"],
                     error.failed_attempts,
@@ -325,6 +327,7 @@ def create_app(
 
             _record_fallback_transitions(
                 observability,
+                request.state.trace_id,
                 principal,
                 request_body["model"],
                 failed_attempts,
@@ -347,6 +350,8 @@ def create_app(
                     circuits=circuits,
                     usage_ledger=usage_ledger,
                     route_decision_store=route_decision_store,
+                    observability=observability,
+                    trace_id=request.state.trace_id,
                 ),
                 media_type="text/event-stream",
                 headers={
@@ -366,6 +371,7 @@ def create_app(
         except AllCandidatesFailed as error:
             _record_fallback_transitions(
                 observability,
+                request.state.trace_id,
                 principal,
                 request_body["model"],
                 error.failed_attempts,
@@ -390,6 +396,7 @@ def create_app(
 
         _record_fallback_transitions(
             observability,
+            request.state.trace_id,
             principal,
             request_body["model"],
             failed_attempts,
@@ -497,6 +504,7 @@ def create_app(
         circuit_candidates, circuit_rejections = _circuit_eligible_candidates(
             decision.candidates,
             circuits,
+            observability,
         )
         if not circuit_candidates:
             route_decision_store.record(
@@ -517,17 +525,16 @@ def create_app(
                 "all_provider_circuits_open",
                 "All eligible provider circuits are open.",
             )
-        candidates, budget_rejections, estimated_cost = _budget_eligible_candidates(
+        candidates, budget_rejections, reservation = _reserve_budget(
             circuit_candidates,
             request_body,
             endpoint="embeddings",
+            budget=budget,
+            principal=principal,
+            observability=observability,
+            trace_id=request.state.trace_id,
         )
         rejected_candidates = (*decision.rejected, *circuit_rejections, *budget_rejections)
-        reservation = budget.reserve(
-            principal,
-            estimated_cost,
-            limit_usd=principal.budget_limit_usd,
-        )
         try:
             token_reservation = _reserve_quotas(
                 quota,
@@ -549,6 +556,7 @@ def create_app(
         except AllCandidatesFailed as error:
             _record_fallback_transitions(
                 observability,
+                request.state.trace_id,
                 principal,
                 request_body["model"],
                 error.failed_attempts,
@@ -573,6 +581,7 @@ def create_app(
 
         _record_fallback_transitions(
             observability,
+            request.state.trace_id,
             principal,
             request_body["model"],
             failed_attempts,
@@ -895,11 +904,19 @@ def _budget_eligible_candidates(
 def _circuit_eligible_candidates(
     candidates,
     circuits: CircuitBreaker,
+    observability: Observability,
 ) -> tuple[tuple[Any, ...], tuple[dict[str, str], ...]]:
     eligible: list[Any] = []
     rejected: list[dict[str, str]] = []
     for candidate in candidates:
-        if circuits.is_open(candidate.provider, candidate.provider_model_id):
+        is_open = circuits.is_open(candidate.provider, candidate.provider_model_id)
+        _set_circuit_gauge(
+            observability,
+            candidate.provider,
+            candidate.provider_model_id,
+            is_open,
+        )
+        if is_open:
             rejected.append(
                 {
                     "provider": candidate.provider,
@@ -910,6 +927,57 @@ def _circuit_eligible_candidates(
             continue
         eligible.append(candidate)
     return tuple(eligible), tuple(rejected)
+
+
+def _reserve_budget(
+    candidates,
+    request_body: dict[str, Any],
+    endpoint: str,
+    budget: BudgetService,
+    principal: Principal,
+    observability: Observability,
+    trace_id: str,
+):
+    started_at = monotonic()
+    attributes = {
+        "tenant": principal.tenant_id,
+        "project": principal.project_id,
+        "endpoint": endpoint,
+    }
+    try:
+        eligible, rejected, estimated_cost = _budget_eligible_candidates(
+            candidates,
+            request_body,
+            endpoint=endpoint,
+        )
+        reservation = budget.reserve(
+            principal,
+            estimated_cost,
+            limit_usd=principal.budget_limit_usd,
+        )
+    except MixAPIError as error:
+        if error.type == "budget_exceeded":
+            duration_ms = max((monotonic() - started_at) * 1000, 0)
+            observability.increment_counter(
+                "mixapi_budget_denials_total",
+                {"tenant": principal.tenant_id, "project": principal.project_id},
+            )
+            observability.record_span(
+                "budget.reserve",
+                trace_id=trace_id,
+                status="error",
+                duration_ms=duration_ms,
+                attributes={**attributes, "error_class": error.code},
+            )
+        raise
+    observability.record_span(
+        "budget.reserve",
+        trace_id=trace_id,
+        status="ok",
+        duration_ms=max((monotonic() - started_at) * 1000, 0),
+        attributes=attributes,
+    )
+    return eligible, rejected, reservation
 
 
 def _estimate_candidate_request_cost(request_body: dict[str, Any], candidate, endpoint: str) -> Decimal:
@@ -961,7 +1029,7 @@ def _dispatch_response_with_fallback(
     request_body: dict[str, Any],
     candidates,
     circuits: CircuitBreaker,
-    observability: InMemoryObservability,
+    observability: Observability,
     trace_id: str,
 ) -> tuple[AdapterResponse, Any, list[dict[str, str]]]:
     failed_attempts: list[dict[str, str]] = []
@@ -980,6 +1048,13 @@ def _dispatch_response_with_fallback(
                 started_at=started_at,
             )
             circuits.record_success(candidate.provider, candidate.provider_model_id)
+            _record_circuit_state(
+                observability,
+                circuits,
+                trace_id,
+                candidate.provider,
+                candidate.provider_model_id,
+            )
             return response, candidate, failed_attempts
         except ProviderDispatchError as error:
             _record_provider_attempt(
@@ -993,6 +1068,13 @@ def _dispatch_response_with_fallback(
                 error_class=error.reason,
             )
             circuits.record_failure(error.provider, error.provider_model_id, error.reason)
+            _record_circuit_state(
+                observability,
+                circuits,
+                trace_id,
+                error.provider,
+                error.provider_model_id,
+            )
             failed_attempts.append(
                 {
                     "provider": error.provider,
@@ -1010,7 +1092,7 @@ def _dispatch_response_stream_with_fallback(
     request_body: dict[str, Any],
     candidates,
     circuits: CircuitBreaker,
-    observability: InMemoryObservability,
+    observability: Observability,
     trace_id: str,
 ) -> tuple[ProviderStream, Any, list[dict[str, str]]]:
     failed_attempts: list[dict[str, str]] = []
@@ -1041,6 +1123,13 @@ def _dispatch_response_stream_with_fallback(
                 error_class=error.reason,
             )
             circuits.record_failure(error.provider, error.provider_model_id, error.reason)
+            _record_circuit_state(
+                observability,
+                circuits,
+                trace_id,
+                error.provider,
+                error.provider_model_id,
+            )
             failed_attempts.append(
                 {
                     "provider": error.provider,
@@ -1068,6 +1157,8 @@ def _native_response_event_stream(
     circuits: CircuitBreaker,
     usage_ledger: Any,
     route_decision_store: Any,
+    observability: Observability,
+    trace_id: str,
 ):
     response_id = f"resp_{uuid.uuid4().hex}"
     output_chunks: list[str] = []
@@ -1110,6 +1201,8 @@ def _native_response_event_stream(
             circuits=circuits,
             usage_ledger=usage_ledger,
             route_decision_store=route_decision_store,
+            observability=observability,
+            trace_id=trace_id,
             output_text="".join(output_chunks),
             reason="client_disconnected",
         )
@@ -1129,6 +1222,8 @@ def _native_response_event_stream(
             circuits=circuits,
             usage_ledger=usage_ledger,
             route_decision_store=route_decision_store,
+            observability=observability,
+            trace_id=trace_id,
             output_text="".join(output_chunks),
             reason=error.reason,
         )
@@ -1160,6 +1255,13 @@ def _native_response_event_stream(
     budget.reconcile(reservation, cost)
     quota.reconcile_tokens(token_reservation, input_tokens + output_tokens)
     circuits.record_success(selected_candidate.provider, selected_candidate.provider_model_id)
+    _record_circuit_state(
+        observability,
+        circuits,
+        trace_id,
+        selected_candidate.provider,
+        selected_candidate.provider_model_id,
+    )
     usage_ledger.record(
         _response_usage_event(
             request_id=request_id,
@@ -1219,6 +1321,8 @@ def _finalize_interrupted_stream(
     circuits: CircuitBreaker,
     usage_ledger: Any,
     route_decision_store: Any,
+    observability: Observability,
+    trace_id: str,
     output_text: str,
     reason: str,
 ) -> None:
@@ -1237,6 +1341,30 @@ def _finalize_interrupted_stream(
         selected_candidate.provider_model_id,
         reason,
     )
+    _record_circuit_state(
+        observability,
+        circuits,
+        trace_id,
+        selected_candidate.provider,
+        selected_candidate.provider_model_id,
+    )
+    if reason != "client_disconnected":
+        observability.increment_counter(
+            "mixapi_provider_errors_total",
+            {"provider": selected_candidate.provider, "error_class": reason},
+        )
+        observability.record_span(
+            "provider.stream",
+            trace_id=trace_id,
+            status="error",
+            duration_ms=0,
+            attributes={
+                "endpoint": "responses",
+                "provider": selected_candidate.provider,
+                "provider_model": selected_candidate.provider_model_id,
+                "error_class": reason,
+            },
+        )
     usage_ledger.record(
         _response_usage_event(
             request_id=request_id,
@@ -1350,7 +1478,7 @@ def _dispatch_embedding_with_fallback(
     request_body: dict[str, Any],
     candidates,
     circuits: CircuitBreaker,
-    observability: InMemoryObservability,
+    observability: Observability,
     trace_id: str,
 ) -> tuple[AdapterResponse, Any, list[dict[str, str]]]:
     failed_attempts: list[dict[str, str]] = []
@@ -1369,6 +1497,13 @@ def _dispatch_embedding_with_fallback(
                 started_at=started_at,
             )
             circuits.record_success(candidate.provider, candidate.provider_model_id)
+            _record_circuit_state(
+                observability,
+                circuits,
+                trace_id,
+                candidate.provider,
+                candidate.provider_model_id,
+            )
             return response, candidate, failed_attempts
         except ProviderDispatchError as error:
             _record_provider_attempt(
@@ -1382,6 +1517,13 @@ def _dispatch_embedding_with_fallback(
                 error_class=error.reason,
             )
             circuits.record_failure(error.provider, error.provider_model_id, error.reason)
+            _record_circuit_state(
+                observability,
+                circuits,
+                trace_id,
+                error.provider,
+                error.provider_model_id,
+            )
             failed_attempts.append(
                 {
                     "provider": error.provider,
@@ -1395,7 +1537,7 @@ def _dispatch_embedding_with_fallback(
 
 
 def _record_provider_attempt(
-    observability: InMemoryObservability,
+    observability: Observability,
     trace_id: str,
     endpoint: str,
     provider: str,
@@ -1424,7 +1566,8 @@ def _record_provider_attempt(
 
 
 def _record_fallback_transitions(
-    observability: InMemoryObservability,
+    observability: Observability,
+    trace_id: str,
     principal: Principal,
     logical_model: str,
     failed_attempts: list[dict[str, str]],
@@ -1434,16 +1577,61 @@ def _record_fallback_transitions(
     if selected_candidate is not None:
         destinations.append(selected_candidate.provider)
     for failed_attempt, destination in zip(failed_attempts, destinations, strict=False):
-        observability.increment_counter(
-            "mixapi_fallbacks_total",
-            {
-                "tenant": principal.tenant_id,
-                "model": logical_model,
-                "from_provider": failed_attempt["provider"],
-                "to_provider": destination,
-                "reason": failed_attempt["reason"],
-            },
+        attributes = {
+            "tenant": principal.tenant_id,
+            "model": logical_model,
+            "from_provider": failed_attempt["provider"],
+            "to_provider": destination,
+            "reason": failed_attempt["reason"],
+        }
+        observability.increment_counter("mixapi_fallbacks_total", attributes)
+        observability.record_span(
+            "routing.fallback",
+            trace_id=trace_id,
+            status="ok",
+            duration_ms=0,
+            attributes=attributes,
         )
+
+
+def _record_circuit_state(
+    observability: Observability,
+    circuits: CircuitBreaker,
+    trace_id: str,
+    provider: str,
+    provider_model: str,
+) -> None:
+    is_open = circuits.is_open(provider, provider_model)
+    _set_circuit_gauge(
+        observability,
+        provider,
+        provider_model,
+        is_open,
+    )
+    observability.record_span(
+        "circuit.state",
+        trace_id=trace_id,
+        status="error" if is_open else "ok",
+        duration_ms=0,
+        attributes={
+            "provider": provider,
+            "provider_model": provider_model,
+            "state": "open" if is_open else "closed",
+        },
+    )
+
+
+def _set_circuit_gauge(
+    observability: Observability,
+    provider: str,
+    provider_model: str,
+    is_open: bool,
+) -> None:
+    observability.set_gauge(
+        "mixapi_circuit_state",
+        int(is_open),
+        {"provider": provider, "provider_model": provider_model},
+    )
 
 
 def _route_attempts(

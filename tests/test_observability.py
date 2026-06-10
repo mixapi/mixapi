@@ -1,4 +1,5 @@
 import unittest
+from decimal import Decimal
 
 from fastapi.testclient import TestClient
 
@@ -91,7 +92,7 @@ class ObservabilityEndpointTest(unittest.TestCase):
             dict(latency[0].labels),
             {"provider": "openai", "provider_model": "gpt-4.1-mini"},
         )
-        spans = app.state.observability.spans()
+        spans = _spans(app, "provider.dispatch")
         self.assertEqual(len(spans), 1)
         self.assertEqual(spans[0].name, "provider.dispatch")
         self.assertEqual(spans[0].trace_id, "trace_provider_success")
@@ -133,9 +134,12 @@ class ObservabilityEndpointTest(unittest.TestCase):
                 "to_provider": "openai",
             },
         )
-        spans = app.state.observability.spans()
+        spans = _spans(app, "provider.dispatch")
         self.assertEqual([span.status for span in spans], ["error", "ok"])
         self.assertEqual({span.trace_id for span in spans}, {"trace_fallback"})
+        fallback_span = _spans(app, "routing.fallback")[0]
+        self.assertEqual(fallback_span.trace_id, "trace_fallback")
+        self.assertEqual(dict(fallback_span.attributes)["from_provider"], "ollama")
 
     def test_embedding_records_provider_dispatch_span(self) -> None:
         app = create_app()
@@ -152,7 +156,7 @@ class ObservabilityEndpointTest(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        span = app.state.observability.spans()[0]
+        span = _spans(app, "provider.dispatch")[0]
         self.assertEqual(dict(span.attributes)["endpoint"], "embeddings")
         self.assertEqual(span.trace_id, "trace_embedding")
 
@@ -174,17 +178,120 @@ class ObservabilityEndpointTest(unittest.TestCase):
             list(response.iter_lines())
 
         self.assertEqual(response.status_code, 200)
-        spans = app.state.observability.spans()
+        spans = _spans(app, "provider.dispatch")
         self.assertEqual([span.status for span in spans], ["error", "ok"])
         self.assertEqual(
             len(_metric_samples(app, "counter", "mixapi_fallbacks_total")),
             1,
         )
 
+    def test_circuit_state_gauges_track_failed_and_successful_providers(self) -> None:
+        app = create_app(
+            failed_response_providers={"ollama"},
+            circuit_failure_threshold=1,
+        )
+        client = TestClient(app)
+
+        response = client.post(
+            "/v1/responses",
+            headers=AUTH_HEADERS,
+            json={
+                "model": "mixapi/balanced-chat",
+                "input": "Circuit telemetry",
+                "routing": {"objective": "lowest-cost"},
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        gauges = {
+            tuple(sample.labels): sample.value
+            for sample in _metric_samples(app, "gauge", "mixapi_circuit_state")
+        }
+        self.assertEqual(
+            gauges[
+                (("provider", "ollama"), ("provider_model", "llama3.1"))
+            ],
+            1,
+        )
+        self.assertEqual(
+            gauges[
+                (("provider", "openai"), ("provider_model", "gpt-4.1-mini"))
+            ],
+            0,
+        )
+        circuit_spans = _spans(app, "circuit.state")
+        self.assertTrue(
+            any(
+                dict(span.attributes).get("provider") == "ollama"
+                and dict(span.attributes).get("state") == "open"
+                for span in circuit_spans
+            )
+        )
+
+    def test_request_budget_denial_records_metric_and_failed_span(self) -> None:
+        app = create_app()
+        client = TestClient(app)
+
+        response = client.post(
+            "/v1/responses",
+            headers={**AUTH_HEADERS, "traceparent": "trace_request_budget"},
+            json={
+                "model": "mixapi/balanced-chat",
+                "input": "Budget telemetry",
+                "max_output_tokens": 4,
+                "routing": {"max_cost_usd": "0.000006"},
+                "native": {"provider": "openai"},
+            },
+        )
+
+        self.assertEqual(response.status_code, 402)
+        denial = _metric_samples(app, "counter", "mixapi_budget_denials_total")[0]
+        self.assertEqual(
+            dict(denial.labels),
+            {"project": "project_dev", "tenant": "tenant_dev"},
+        )
+        span = [span for span in app.state.observability.spans() if span.name == "budget.reserve"][0]
+        self.assertEqual(span.trace_id, "trace_request_budget")
+        self.assertEqual(span.status, "error")
+        self.assertEqual(dict(span.attributes)["error_class"], "request_budget_exceeded")
+
+    def test_api_key_budget_denial_records_metric_and_failed_span(self) -> None:
+        app = create_app(budget_limit_usd=Decimal("0.00001000"))
+        client = TestClient(app)
+        request_body = {
+            "model": "mixapi/balanced-chat",
+            "input": "Budget telemetry",
+            "max_output_tokens": 4,
+            "native": {"provider": "openai"},
+        }
+
+        first = client.post("/v1/responses", headers=AUTH_HEADERS, json=request_body)
+        second = client.post(
+            "/v1/responses",
+            headers={**AUTH_HEADERS, "traceparent": "trace_key_budget"},
+            json=request_body,
+        )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 402)
+        denials = _metric_samples(app, "counter", "mixapi_budget_denials_total")
+        self.assertEqual(len(denials), 1)
+        spans = [
+            span
+            for span in app.state.observability.spans()
+            if span.name == "budget.reserve" and span.trace_id == "trace_key_budget"
+        ]
+        self.assertEqual(spans[0].status, "error")
+        self.assertEqual(dict(spans[0].attributes)["error_class"], "api_key_budget_exceeded")
+
 
 def _metric_samples(app, kind: str, name: str):
     samples = getattr(app.state.observability, f"{kind}_samples")()
     return [sample for sample in samples if sample.name == name]
+
+
+def _spans(app, name: str):
+    return [span for span in app.state.observability.spans() if span.name == name]
 
 
 if __name__ == "__main__":

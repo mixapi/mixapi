@@ -10,6 +10,7 @@ from mixapi.auth import Principal
 from mixapi.budget import InMemoryBudgetService
 from mixapi.catalog import default_catalog
 from mixapi.circuits import InMemoryCircuitBreaker
+from mixapi.observability import InMemoryObservability
 from mixapi.quota import InMemoryQuotaService
 from mixapi.route_decisions import InMemoryRouteDecisionStore
 from mixapi.streaming import _text_deltas
@@ -127,6 +128,8 @@ class StreamingTest(unittest.TestCase):
             circuits=InMemoryCircuitBreaker(),
             usage_ledger=usage,
             route_decision_store=routes,
+            observability=InMemoryObservability(),
+            trace_id="trace_disconnect",
         )
 
         next(event_stream)

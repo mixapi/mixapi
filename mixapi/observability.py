@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from threading import Lock
-from typing import Mapping
+from typing import Mapping, Protocol
 
 
 AttributeValue = str | int | float | bool
@@ -24,6 +24,38 @@ class SpanRecord:
     status: str
     duration_ms: float
     attributes: Attributes
+
+
+class Observability(Protocol):
+    def increment_counter(
+        self,
+        name: str,
+        labels: Mapping[str, object],
+        amount: float = 1,
+    ) -> None: ...
+
+    def observe_histogram(
+        self,
+        name: str,
+        value: float,
+        labels: Mapping[str, object],
+    ) -> None: ...
+
+    def set_gauge(
+        self,
+        name: str,
+        value: float,
+        labels: Mapping[str, object],
+    ) -> None: ...
+
+    def record_span(
+        self,
+        name: str,
+        trace_id: str,
+        status: str,
+        duration_ms: float,
+        attributes: Mapping[str, AttributeValue],
+    ) -> None: ...
 
 
 @dataclass
