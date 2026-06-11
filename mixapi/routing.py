@@ -28,6 +28,7 @@ def plan_route(
     model_allowlist: tuple[str, ...] | None = None,
     default_objective: str | None = None,
     selection_seed: str = "",
+    connection_pin: str | None = None,
 ) -> RouteDecision:
     requested_model = request_body.get("model")
     if not isinstance(requested_model, str) or not requested_model:
@@ -66,6 +67,7 @@ def plan_route(
         rejection = _rejection_reason(
             candidate=candidate,
             provider_pin=provider_pin,
+            connection_pin=connection_pin,
             required_input_modalities=required_input_modalities,
             required_output_modality=required_output_modality,
             requires_strict_schema=requires_strict_schema,
@@ -99,6 +101,7 @@ def plan_route(
 def _rejection_reason(
     candidate: ProviderModel,
     provider_pin: str | None,
+    connection_pin: str | None,
     required_input_modalities: set[str],
     required_output_modality: str,
     requires_strict_schema: bool,
@@ -107,6 +110,8 @@ def _rejection_reason(
 ) -> str | None:
     if candidate.status != "active":
         return "model_disabled"
+    if connection_pin and candidate.provider_connection_id != connection_pin:
+        return "connection_not_pinned"
     if provider_pin and provider_pin not in {
         candidate.provider,
         candidate.provider_connection_id,
@@ -262,7 +267,7 @@ def _token_cost(candidate: ProviderModel) -> Decimal:
 
 def _best_rejection_code(rejected: list[dict[str, str]]) -> str:
     for rejection in rejected:
-        if rejection["reason"] != "provider_not_pinned":
+        if rejection["reason"] not in {"provider_not_pinned", "connection_not_pinned"}:
             return rejection["reason"]
     return rejected[0]["reason"] if rejected else "no_eligible_provider"
 

@@ -36,6 +36,8 @@ class ProviderModel:
     weight: int = 1
     latency_ms: Decimal = Decimal("1000")
     reliability: Decimal = Decimal("0")
+    concurrency_limit: int | None = None
+    request_quota: int | None = None
 
 
 @dataclass(frozen=True)

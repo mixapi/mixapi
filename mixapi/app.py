@@ -67,6 +67,7 @@ from mixapi.runtime.circuits import RedisCircuitBreaker
 from mixapi.runtime.context import RequestRuntimeContext
 from mixapi.runtime.idempotency import RedisIdempotencyStore
 from mixapi.runtime.quota import RedisQuotaService
+from mixapi.runtime.sessions import RedisStickySessionStore
 from mixapi.runtime.snapshots import RedisSnapshotStore
 from mixapi.route_decisions import RouteDecisionRecord
 from mixapi.routing import plan_route
@@ -180,6 +181,10 @@ def create_app(
         namespace=configured_settings.redis_namespace,
         ttl_seconds=configured_settings.idempotency_ttl_seconds,
     )
+    session_store = RedisStickySessionStore(
+        redis_runtime.client,
+        namespace=configured_settings.redis_namespace,
+    )
     route_decision_store = PostgresRouteDecisionStore(postgres_pool)
     credential_cipher = CredentialCipher(
         configured_settings.master_key,
@@ -260,6 +265,7 @@ def create_app(
     instrumentation = SafeObservability(observability)
     app.state.usage_ledger = usage_ledger
     app.state.idempotency_store = idempotency_store
+    app.state.session_store = session_store
     app.state.route_decision_store = route_decision_store
     app.state.quota = quota
     app.state.budget = budget
@@ -366,6 +372,11 @@ def create_app(
         if replay := idempotency_store.replay(principal, "responses", idempotency_key, request_body):
             return replay.response
 
+        session_id = request.headers.get("x-mixapi-session-id")
+        connection_pin = None
+        if session_id:
+            connection_pin = session_store.get_connection_id(principal.tenant_id, session_id)
+
         decision = plan_route(
             snapshot,
             request_body,
@@ -373,6 +384,7 @@ def create_app(
             model_allowlist=principal.model_allowlist,
             default_objective=principal.routing_objective,
             selection_seed=request.state.request_id,
+            connection_pin=connection_pin,
         )
         circuit_candidates, circuit_rejections = _circuit_eligible_candidates(
             decision.candidates,
@@ -443,6 +455,7 @@ def create_app(
                         request_body=request_body,
                         candidates=candidates,
                         circuits=circuits,
+                        quota=quota,
                         observability=request_observability,
                         trace_id=request.state.trace_id,
                     )
@@ -516,6 +529,7 @@ def create_app(
                 request_body=request_body,
                 candidates=candidates,
                 circuits=circuits,
+                quota=quota,
                 observability=request_observability,
                 trace_id=request.state.trace_id,
             )
@@ -585,6 +599,13 @@ def create_app(
             failed_attempts,
             selected_candidate,
         )
+
+        if session_id and selected_candidate.provider_connection_id:
+            session_store.set_connection_id(
+                principal.tenant_id,
+                session_id,
+                selected_candidate.provider_connection_id,
+            )
 
         response_id = f"resp_{uuid.uuid4().hex}"
         input_tokens, output_tokens, cost = _billable_dispatch_totals(
@@ -684,6 +705,11 @@ def create_app(
         if replay := idempotency_store.replay(principal, "embeddings", idempotency_key, request_body):
             return replay.response
 
+        session_id = request.headers.get("x-mixapi-session-id")
+        connection_pin = None
+        if session_id:
+            connection_pin = session_store.get_connection_id(principal.tenant_id, session_id)
+
         decision = plan_route(
             snapshot,
             request_body,
@@ -691,6 +717,7 @@ def create_app(
             model_allowlist=principal.model_allowlist,
             default_objective=principal.routing_objective,
             selection_seed=request.state.request_id,
+            connection_pin=connection_pin,
         )
         circuit_candidates, circuit_rejections = _circuit_eligible_candidates(
             decision.candidates,
@@ -759,6 +786,7 @@ def create_app(
                 request_body=request_body,
                 candidates=candidates,
                 circuits=circuits,
+                quota=quota,
                 observability=request_observability,
                 trace_id=request.state.trace_id,
             )
@@ -1344,6 +1372,7 @@ def _dispatch_response_with_fallback(
     request_body: dict[str, Any],
     candidates,
     circuits: CircuitBreaker,
+    quota: RedisQuotaService,
     observability: Observability,
     trace_id: str,
 ) -> ResponseDispatchOutcome:
@@ -1353,6 +1382,35 @@ def _dispatch_response_with_fallback(
     validation_failures: tuple[ValidationFailure, ...] = ()
 
     for candidate in candidates:
+        if candidate.provider_connection_id and candidate.concurrency_limit:
+            if not quota.reserve_concurrency(candidate.provider_connection_id, candidate.concurrency_limit):
+                failed_attempts.append(
+                    {
+                        "provider": candidate.provider,
+                        "model": candidate.provider_model_id,
+                        "reason": "concurrency_limit_exceeded",
+                    }
+                )
+                continue
+
+        if candidate.provider_connection_id and candidate.request_quota:
+            if not quota.reserve_connection_requests(candidate.provider_connection_id, candidate.request_quota):
+                failed_attempts.append(
+                    {
+                        "provider": candidate.provider,
+                        "model": candidate.provider_model_id,
+                        "reason": "request_quota_exceeded",
+                    }
+                )
+                continue
+
+        concurrency_released = False
+        def _release_concurrency() -> None:
+            nonlocal concurrency_released
+            if not concurrency_released and candidate.provider_connection_id and candidate.concurrency_limit:
+                quota.release_concurrency(candidate.provider_connection_id)
+                concurrency_released = True
+
         dispatch_request = request_body
         dispatch_count = 2 if schema is not None else 1
         for dispatch_index in range(dispatch_count):
@@ -1447,6 +1505,8 @@ def _dispatch_response_with_fallback(
             if dispatch_index == 0:
                 dispatch_request = corrective_request(request_body, validation.failures)
 
+        _release_concurrency()
+
     raise AllCandidatesFailed(
         failed_attempts,
         billable_dispatches,
@@ -1459,18 +1519,56 @@ def _dispatch_response_stream_with_fallback(
     request_body: dict[str, Any],
     candidates,
     circuits: CircuitBreaker,
+    quota: RedisQuotaService,
     observability: Observability,
     trace_id: str,
 ) -> tuple[ProviderStream, Any, list[dict[str, str]]]:
     failed_attempts: list[dict[str, str]] = []
 
     for candidate in candidates:
+        if candidate.provider_connection_id and candidate.concurrency_limit:
+            if not quota.reserve_concurrency(candidate.provider_connection_id, candidate.concurrency_limit):
+                failed_attempts.append(
+                    {
+                        "provider": candidate.provider,
+                        "model": candidate.provider_model_id,
+                        "reason": "concurrency_limit_exceeded",
+                    }
+                )
+                continue
+
+        if candidate.provider_connection_id and candidate.request_quota:
+            if not quota.reserve_connection_requests(candidate.provider_connection_id, candidate.request_quota):
+                failed_attempts.append(
+                    {
+                        "provider": candidate.provider,
+                        "model": candidate.provider_model_id,
+                        "reason": "request_quota_exceeded",
+                    }
+                )
+                continue
+
+        concurrency_released = False
+        def _release_concurrency(conn_id=candidate.provider_connection_id, limit=candidate.concurrency_limit) -> None:
+            nonlocal concurrency_released
+            if not concurrency_released and conn_id and limit:
+                quota.release_concurrency(conn_id)
+                concurrency_released = True
+
         started_at = monotonic()
         try:
             stream = _adapter_for(adapter, candidate).start_response_stream(
                 request_body,
                 candidate,
             )
+            original_close = stream._close
+            def wrapped_close():
+                try:
+                    original_close()
+                finally:
+                    _release_concurrency()
+            stream._close = wrapped_close
+
             _record_provider_attempt(
                 observability,
                 trace_id,
@@ -1482,6 +1580,7 @@ def _dispatch_response_stream_with_fallback(
             )
             return stream, candidate, failed_attempts
         except ProviderDispatchError as error:
+            _release_concurrency()
             _record_provider_attempt(
                 observability,
                 trace_id,
@@ -1508,6 +1607,9 @@ def _dispatch_response_stream_with_fallback(
                     "reason": error.reason,
                 }
             )
+        except Exception:
+            _release_concurrency()
+            raise
 
     raise AllCandidatesFailed(failed_attempts)
 
@@ -1971,63 +2073,96 @@ def _dispatch_embedding_with_fallback(
     request_body: dict[str, Any],
     candidates,
     circuits: CircuitBreaker,
+    quota: RedisQuotaService,
     observability: Observability,
     trace_id: str,
 ) -> tuple[AdapterResponse, Any, list[dict[str, str]]]:
     failed_attempts: list[dict[str, str]] = []
 
     for candidate in candidates:
-        started_at = monotonic()
+        if candidate.provider_connection_id and candidate.concurrency_limit:
+            if not quota.reserve_concurrency(candidate.provider_connection_id, candidate.concurrency_limit):
+                failed_attempts.append(
+                    {
+                        "provider": candidate.provider,
+                        "model": candidate.provider_model_id,
+                        "reason": "concurrency_limit_exceeded",
+                    }
+                )
+                continue
+
+        if candidate.provider_connection_id and candidate.request_quota:
+            if not quota.reserve_connection_requests(candidate.provider_connection_id, candidate.request_quota):
+                failed_attempts.append(
+                    {
+                        "provider": candidate.provider,
+                        "model": candidate.provider_model_id,
+                        "reason": "request_quota_exceeded",
+                    }
+                )
+                continue
+
+        concurrency_released = False
+        def _release_concurrency() -> None:
+            nonlocal concurrency_released
+            if not concurrency_released and candidate.provider_connection_id and candidate.concurrency_limit:
+                quota.release_concurrency(candidate.provider_connection_id)
+                concurrency_released = True
+
         try:
-            response = _adapter_for(adapter, candidate).dispatch_embedding(
-                request_body,
-                candidate,
-            )
-            _record_provider_attempt(
-                observability,
-                trace_id,
-                endpoint="embeddings",
-                provider=candidate.provider,
-                provider_model=candidate.provider_model_id,
-                status="ok",
-                started_at=started_at,
-            )
-            circuits.record_success(candidate.provider, candidate.provider_model_id)
-            _record_circuit_state(
-                observability,
-                circuits,
-                trace_id,
-                candidate.provider,
-                candidate.provider_model_id,
-            )
-            return response, candidate, failed_attempts
-        except ProviderDispatchError as error:
-            _record_provider_attempt(
-                observability,
-                trace_id,
-                endpoint="embeddings",
-                provider=error.provider,
-                provider_model=error.provider_model_id,
-                status="error",
-                started_at=started_at,
-                error_class=error.reason,
-            )
-            circuits.record_failure(error.provider, error.provider_model_id, error.reason)
-            _record_circuit_state(
-                observability,
-                circuits,
-                trace_id,
-                error.provider,
-                error.provider_model_id,
-            )
-            failed_attempts.append(
-                {
-                    "provider": error.provider,
-                    "provider_model": error.provider_model_id,
-                    "status": "failed",
-                    "reason": error.reason,
-                }
-            )
+            started_at = monotonic()
+            try:
+                response = _adapter_for(adapter, candidate).dispatch_embedding(
+                    request_body,
+                    candidate,
+                )
+                _record_provider_attempt(
+                    observability,
+                    trace_id,
+                    endpoint="embeddings",
+                    provider=candidate.provider,
+                    provider_model=candidate.provider_model_id,
+                    status="ok",
+                    started_at=started_at,
+                )
+                circuits.record_success(candidate.provider, candidate.provider_model_id)
+                _record_circuit_state(
+                    observability,
+                    circuits,
+                    trace_id,
+                    candidate.provider,
+                    candidate.provider_model_id,
+                )
+                return response, candidate, failed_attempts
+            except ProviderDispatchError as error:
+                _record_provider_attempt(
+                    observability,
+                    trace_id,
+                    endpoint="embeddings",
+                    provider=error.provider,
+                    provider_model=error.provider_model_id,
+                    status="error",
+                    started_at=started_at,
+                    error_class=error.reason,
+                )
+                circuits.record_failure(error.provider, error.provider_model_id, error.reason)
+                _record_circuit_state(
+                    observability,
+                    circuits,
+                    trace_id,
+                    error.provider,
+                    error.provider_model_id,
+                )
+                failed_attempts.append(
+                    {
+                        "provider": error.provider,
+                        "provider_model": error.provider_model_id,
+                        "status": "failed",
+                        "reason": error.reason,
+                    }
+                )
+        finally:
+            _release_concurrency()
 
     raise AllCandidatesFailed(failed_attempts)
 

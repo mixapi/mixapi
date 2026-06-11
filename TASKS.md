@@ -9,6 +9,10 @@ This backlog closes the highest-priority gaps between the current implementation
 - [x] Add in-memory provider-model circuit breakers that open after repeated transient failures and exclude open circuits from fallback attempts.
 - [x] Add tenant-scoped CSV usage export with the same data isolation as the JSON usage endpoint.
 - [x] Run the complete test suite, compilation checks, and whitespace validation.
+- [x] Implement sticky sessions via a custom header to pin provider connections.
+- [x] Implement per-account concurrency tracking to limit active requests per upstream connection.
+- [x] Add account-level quotas to enforce token/request limits on provider connections.
+- [x] Support automated account rotation by selecting alternative candidate connections when limits are hit.
 
 ## Deferred Follow-Ups
 

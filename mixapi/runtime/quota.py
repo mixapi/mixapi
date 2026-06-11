@@ -44,6 +44,31 @@ redis.call('DECRBY', KEYS[1], tonumber(amount))
 return 1
 """
 
+_RESERVE_CONCURRENCY = """
+local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+local limit = tonumber(ARGV[1])
+if limit > 0 and current >= limit then return 0 end
+redis.call('INCR', KEYS[1])
+redis.call('EXPIRE', KEYS[1], 3600)
+return 1
+"""
+
+_RELEASE_CONCURRENCY = """
+local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+if current > 0 then
+    redis.call('DECR', KEYS[1])
+end
+return 1
+"""
+
+_RESERVE_CONNECTION_REQUESTS = """
+local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+local limit = tonumber(ARGV[1])
+if limit > 0 and current >= limit then return 0 end
+redis.call('INCR', KEYS[1])
+redis.call('EXPIRE', KEYS[1], 86400 * 30)
+return 1
+"""
 
 class RedisQuotaService:
     def __init__(
@@ -61,6 +86,9 @@ class RedisQuotaService:
         self._reserve_tokens = LuaScript(client, _RESERVE_TOKENS)
         self._reconcile_tokens = LuaScript(client, _RECONCILE_TOKENS)
         self._release_tokens = LuaScript(client, _RELEASE_TOKENS)
+        self._reserve_concurrency_script = LuaScript(client, _RESERVE_CONCURRENCY)
+        self._release_concurrency_script = LuaScript(client, _RELEASE_CONCURRENCY)
+        self._reserve_connection_requests_script = LuaScript(client, _RESERVE_CONNECTION_REQUESTS)
 
     def reserve_request(self, principal: Principal) -> None:
         if self.request_limit is None:
@@ -112,3 +140,33 @@ class RedisQuotaService:
             f"{prefix}:reserved",
             f"{prefix}:reservation:{reservation_id}",
         ]
+
+    def _concurrency_key(self, connection_id: str) -> str:
+        return f"{self._namespace}:v1:concurrency:{connection_id}"
+
+    def reserve_concurrency(self, connection_id: str, limit: int | None) -> bool:
+        if limit is None or limit <= 0:
+            return True
+        accepted = self._reserve_concurrency_script(
+            [self._concurrency_key(connection_id)],
+            [limit]
+        )
+        return bool(accepted)
+
+    def release_concurrency(self, connection_id: str) -> None:
+        self._release_concurrency_script(
+            [self._concurrency_key(connection_id)],
+            []
+        )
+
+    def _connection_request_key(self, connection_id: str) -> str:
+        return f"{self._namespace}:v1:quota:connection_requests:{connection_id}"
+
+    def reserve_connection_requests(self, connection_id: str, limit: int | None) -> bool:
+        if limit is None or limit <= 0:
+            return True
+        accepted = self._reserve_connection_requests_script(
+            [self._connection_request_key(connection_id)],
+            [limit]
+        )
+        return bool(accepted)

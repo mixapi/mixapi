@@ -44,6 +44,8 @@ def catalog_from_snapshot(snapshot: ConfigurationSnapshot) -> dict[str, LogicalM
                 weight=candidate.weight,
                 latency_ms=_decimal_metadata(provider.metadata, "latency_ms", "1000"),
                 reliability=_decimal_metadata(provider.metadata, "reliability", "0"),
+                concurrency_limit=provider.metadata.get("concurrency_limit"),
+                request_quota=provider.metadata.get("request_quota"),
             )
         )
     return {
