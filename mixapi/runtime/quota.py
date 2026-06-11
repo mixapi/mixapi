@@ -79,6 +79,7 @@ class RedisQuotaService:
         request_limit: int | None = None,
         token_limit: int | None = None,
     ) -> None:
+        self._client = client
         self._namespace = namespace
         self.request_limit = request_limit
         self.token_limit = token_limit

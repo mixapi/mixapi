@@ -23,7 +23,9 @@ class RedisStickySessionStore:
         value = self._client.get(self._key(tenant_id, session_id))
         if value:
             self._client.expire(self._key(tenant_id, session_id), self._ttl)
-            return value.decode("utf-8")
+            if isinstance(value, bytes):
+                return value.decode("utf-8")
+            return str(value)
         return None
 
     def set_connection_id(self, tenant_id: str, session_id: str, connection_id: str) -> None:
